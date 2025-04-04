@@ -13,6 +13,26 @@
 #include "c.h"
 
 #include "mb/pg_wchar.h"
+#include "utils/ascii.h"
+
+
+/*
+ * In today's multibyte encodings other than UTF8, this two-byte sequence
+ * ensures pg_encoding_mblen() == 2 && pg_encoding_verifymbstr() == 0.
+ *
+ * For historical reasons, several verifychar implementations opt to reject
+ * this pair specifically.  Byte pair range constraints, in encoding
+ * originator documentation, always excluded this pair.  No core conversion
+ * could translate it.  However, longstanding verifychar implementations
+ * accepted any non-NUL byte.  big5_to_euc_tw and big5_to_mic even translate
+ * pairs not valid per encoding originator documentation.  To avoid tightening
+ * core or non-core conversions in a security patch, we sought this one pair.
+ *
+ * PQescapeString() historically used spaces for BYTE1; many other values
+ * could suffice for BYTE1.
+ */
+#define NONUTF8_INVALID_BYTE0 (0x8d)
+#define NONUTF8_INVALID_BYTE1 (' ')
 
 
 /*
