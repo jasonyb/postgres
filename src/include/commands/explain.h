@@ -17,6 +17,9 @@
 #include "lib/stringinfo.h"
 #include "parser/parse_node.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 typedef enum ExplainFormat
 {
 	EXPLAIN_FORMAT_TEXT,
@@ -34,6 +37,19 @@ typedef struct ExplainWorkersState
 	StringInfo	prev_str;		/* saved output buffer while redirecting */
 } ExplainWorkersState;
 
+typedef struct YbExplainExecStats
+{
+	YbPgRpcStats read;
+	YbPgRpcStats catalog_read;
+	YbPgRpcStats flush;
+	double		write_count;
+	double		catalog_write_count;
+
+	double		storage_gauge_metrics[YB_STORAGE_GAUGE_COUNT];
+	double		storage_counter_metrics[YB_STORAGE_COUNTER_COUNT];
+	YbPgEventMetric storage_event_metrics[YB_STORAGE_EVENT_COUNT];
+} YbExplainExecStats;
+
 typedef struct ExplainState
 {
 	StringInfo	str;			/* output buffer */
@@ -45,6 +61,7 @@ typedef struct ExplainState
 	bool		wal;			/* print WAL usage */
 	bool		timing;			/* print detailed node timing */
 	bool		summary;		/* print total planning and execution timing */
+	bool		rpc;			/* print RPC stats */
 	bool		settings;		/* print modified settings */
 	ExplainFormat format;		/* output format */
 	/* state for output formatting --- not reset for each new plan tree */
@@ -59,6 +76,12 @@ typedef struct ExplainState
 	bool		hide_workers;	/* set if we find an invisible Gather */
 	/* state related to the current plan node */
 	ExplainWorkersState *workers_state; /* needed if parallel plan */
+
+	YbExplainExecStats yb_stats;	/* hold YB-specific exec stats */
+	bool		yb_debug;		/* print debug information */
+	bool		ybShowHints;	/* generate and display hints that will
+								   produce the same plan as one Explained */
+	bool		ybShowUniqueIds; /* show unique Path/Plan ids */
 } ExplainState;
 
 /* Hook for plugins to get control in ExplainOneQuery() */

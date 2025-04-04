@@ -124,6 +124,7 @@ typedef struct plperl_proc_desc
 	FmgrInfo   *arg_out_func;	/* output fns for arg types */
 	bool	   *arg_is_rowtype; /* is each arg composite? */
 	Oid		   *arg_arraytype;	/* InvalidOid if not an array */
+	uint64		yb_catalog_version; /* catalog version at function load time */
 } plperl_proc_desc;
 
 #define increment_prodesc_refcount(prodesc)  \
@@ -2667,7 +2668,8 @@ validate_plperl_function(plperl_proc_ptr *proc_ptr, HeapTuple procTup)
 		 * This is needed because CREATE OR REPLACE FUNCTION can modify the
 		 * function's pg_proc entry without changing its OID.
 		 ************************************************************/
-		uptodate = (prodesc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
+		uptodate = (IsYugabyteEnabled() ? procdesc->yb_catalog_version == YBGetActiveCatalogCacheVersion() :
+					prodesc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
 					ItemPointerEquals(&prodesc->fn_tid, &procTup->t_self));
 
 		if (uptodate)
@@ -2797,6 +2799,7 @@ compile_plperl_function(Oid fn_oid, bool is_trigger, bool is_event_trigger)
 		prodesc->arg_out_func = (FmgrInfo *) palloc0(prodesc->nargs * sizeof(FmgrInfo));
 		prodesc->arg_is_rowtype = (bool *) palloc0(prodesc->nargs * sizeof(bool));
 		prodesc->arg_arraytype = (Oid *) palloc0(prodesc->nargs * sizeof(Oid));
+		prodesc->yb_catalog_version = YBGetActiveCatalogCacheVersion();
 		MemoryContextSwitchTo(oldcontext);
 
 		/* Remember if function is STABLE/IMMUTABLE */

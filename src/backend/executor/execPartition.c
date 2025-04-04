@@ -35,6 +35,10 @@
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 
+/* YB includes */
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+
 
 /*-----------------------
  * PartitionTupleRouting - Encapsulates all information required to
@@ -515,10 +519,21 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 
 	partrel = table_open(partOid, RowExclusiveLock);
 
+	/*
+	 * The result relation's range table index passed into InitResultRelInfo
+	 * later gets used in the YB code-path to fetch range table entry
+	 * during YBExecUpdateAct(). The actual nominalRelation value needs to be
+	 * passed on in order to correctly fetch the entry.
+	 */
+	int			resultRelationIndex = ((!IsYBRelation(firstResultRel) ||
+										partrel->rd_rel->relkind == RELKIND_FOREIGN_TABLE) ?
+									   0 :
+									   (node ? node->nominalRelation : 1));
+
 	leaf_part_rri = makeNode(ResultRelInfo);
 	InitResultRelInfo(leaf_part_rri,
 					  partrel,
-					  0,
+					  resultRelationIndex,
 					  rootResultRelInfo,
 					  estate->es_instrument);
 
@@ -582,7 +597,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		 */
 		part_attmap =
 			build_attrmap_by_name(RelationGetDescr(partrel),
-								  RelationGetDescr(firstResultRel));
+								  RelationGetDescr(firstResultRel),
+								  false /* yb_ignore_type_mismatch */ );
 		wcoList = (List *)
 			map_variable_attnos((Node *) wcoList,
 								firstVarno, 0,
@@ -639,7 +655,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		if (part_attmap == NULL)
 			part_attmap =
 				build_attrmap_by_name(RelationGetDescr(partrel),
-									  RelationGetDescr(firstResultRel));
+									  RelationGetDescr(firstResultRel),
+									  false /* yb_ignore_type_mismatch */ );
 		returningList = (List *)
 			map_variable_attnos((Node *) returningList,
 								firstVarno, 0,
@@ -778,10 +795,12 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				 * target relation (firstVarno).
 				 */
 				onconflset = copyObject(node->onConflictSet);
+
 				if (part_attmap == NULL)
 					part_attmap =
 						build_attrmap_by_name(RelationGetDescr(partrel),
-											  RelationGetDescr(firstResultRel));
+											  RelationGetDescr(firstResultRel),
+											  false /* yb_ignore_type_mismatch */ );
 				onconflset = (List *)
 					map_variable_attnos((Node *) onconflset,
 										INNER_VAR, 0,
@@ -879,7 +898,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 		if (part_attmap == NULL)
 			part_attmap =
 				build_attrmap_by_name(RelationGetDescr(partrel),
-									  RelationGetDescr(firstResultRel));
+									  RelationGetDescr(firstResultRel),
+									  false /* yb_ignore_type_mismatch */ );
 
 		if (unlikely(!leaf_part_rri->ri_projectNewInfoValid))
 			ExecInitMergeTupleSlots(mtstate, leaf_part_rri);
@@ -1032,6 +1052,10 @@ ExecInitRoutingInfo(ModifyTableState *mtstate,
 			partRelInfo->ri_FdwRoutine->GetForeignModifyBatchSize(partRelInfo);
 	else
 		partRelInfo->ri_BatchSize = 1;
+
+	/* YB: also handle YB insert on conflict read batching. */
+	if (YbIsInsertOnConflictReadBatchingPossible(partRelInfo))
+		partRelInfo->ri_ybIocBatchingPossible = true;
 
 	Assert(partRelInfo->ri_BatchSize >= 1);
 
@@ -2234,4 +2258,10 @@ find_matching_subplans_recurse(PartitionPruningData *prunedata,
 			}
 		}
 	}
+}
+
+Oid
+YbPartitionTupleRoutingRootRelid(PartitionTupleRouting *proute)
+{
+	return RelationGetRelid(proute->partition_root);
 }

@@ -23,6 +23,18 @@
 #include "utils/resowner.h"
 
 
+/*
+ * GUC variable to control how many times a custom plan is chosen over
+ * a generic plan unconditionally. See guc.c for details.
+ */
+extern int	yb_test_planner_custom_plan_threshold;
+
+/*
+ * GUC variable to control whether to prefer a custom plan over a generic
+ * plan based on the number of partitions pruned.
+ */
+extern bool enable_choose_custom_plan_for_partition_pruning;
+
 /* Forward declaration, to avoid including parsenodes.h here */
 struct RawStmt;
 
@@ -132,6 +144,13 @@ typedef struct CachedPlanSource
 	double		total_custom_cost;	/* total cost of custom plans so far */
 	int64		num_custom_plans;	/* # of custom plans included in total */
 	int64		num_generic_plans;	/* # of generic plans */
+	bool		usesPostgresRel;	/* Does this plan use pg relations */
+	int			yb_generic_num_referenced_rels; /* Num rels referenced by
+												 * generic plan */
+	int			yb_custom_max_num_referenced_rels;	/* Max number of relations
+													 * referenced by a custom
+													 * plan */
+
 } CachedPlanSource;
 
 /*

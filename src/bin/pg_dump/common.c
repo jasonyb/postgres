@@ -31,6 +31,9 @@
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 
+/* YB includes */
+#include "catalog/pg_yb_tablegroup.h"
+
 /*
  * Variables for mapping DumpId to DumpableObject
  */
@@ -126,6 +129,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	int			numDefaultACLs;
 	int			numEventTriggers;
 
+	int			numTablegroups;
+
 	/*
 	 * We must read extensions and extension membership info first, because
 	 * extension membership needs to be consultable during decisions about
@@ -170,6 +175,9 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	pg_log_info("reading user-defined access methods");
 	getAccessMethods(fout, &numAccessMethods);
+
+	pg_log_info("reading user-defined tablegroups");
+	(void) getTablegroups(fout, &numTablegroups);
 
 	pg_log_info("reading user-defined operator classes");
 	getOpclasses(fout, &numOpclasses);
@@ -901,6 +909,24 @@ findExtensionByOid(Oid oid)
 	dobj = findObjectByCatalogId(catId);
 	Assert(dobj == NULL || dobj->objType == DO_EXTENSION);
 	return (ExtensionInfo *) dobj;
+}
+
+/*
+ * findTablegroupByOid
+ *	  finds the DumpableObject for the tablegroup with the given oid
+ *	  returns NULL if not found
+ */
+YbTablegroupInfo *
+findTablegroupByOid(Oid oid)
+{
+	CatalogId	catId;
+	DumpableObject *dobj;
+
+	catId.tableoid = YbTablegroupRelationId;
+	catId.oid = oid;
+	dobj = findObjectByCatalogId(catId);
+	Assert(dobj == NULL || dobj->objType == DO_TABLEGROUP);
+	return (YbTablegroupInfo *) dobj;
 }
 
 /*

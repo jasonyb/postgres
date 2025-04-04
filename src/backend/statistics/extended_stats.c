@@ -664,8 +664,8 @@ examine_expression(Node *expr, int stattarget)
 		elog(ERROR, "cache lookup failed for type %u", stats->attrtypid);
 
 	stats->attrtype = (Form_pg_type) GETSTRUCT(typtuple);
-	stats->anl_context = CurrentMemoryContext;	/* XXX should be using
-												 * something else? */
+	stats->anl_context = CurrentMemoryContext; /* XXX should be using
+													 * something else? */
 	stats->tupattnum = InvalidAttrNumber;
 
 	/*
@@ -2484,6 +2484,7 @@ statext_expressions_load(Oid stxoid, bool inh, int idx)
 	ItemPointerSetInvalid(&(tmptup.t_self));
 	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = td;
+	HEAPTUPLE_YBCTID(&tmptup) = 0;
 
 	tup = heap_copytuple(&tmptup);
 

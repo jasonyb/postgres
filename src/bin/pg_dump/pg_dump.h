@@ -82,7 +82,8 @@ typedef enum
 	DO_PUBLICATION,
 	DO_PUBLICATION_REL,
 	DO_PUBLICATION_TABLE_IN_SCHEMA,
-	DO_SUBSCRIPTION
+	DO_SUBSCRIPTION,
+	DO_TABLEGROUP
 } DumpableObjectType;
 
 /*
@@ -345,6 +346,8 @@ typedef struct _tableInfo
 	bool	   *inhNotNull;		/* true if NOT NULL is inherited */
 	struct _attrDefInfo **attrdefs; /* DEFAULT expressions */
 	struct _constraintInfo *checkexprs; /* CHECK constraints */
+	struct _indxInfo *primaryKeyIndex;	/* Associated index of a PRIMARY KEY
+										 * constraint */
 	bool		needs_override; /* has GENERATED ALWAYS AS IDENTITY */
 	char	   *amname;			/* relation access method */
 
@@ -359,6 +362,18 @@ typedef struct _tableInfo
 	int			numTriggers;	/* number of triggers for table */
 	struct _triggerInfo *triggers;	/* array of TriggerInfo structs */
 } TableInfo;
+
+typedef struct _ybTablegroupInfo
+{
+	/*
+	 * These fields are collected for every tablegroup in the database.
+	 */
+	DumpableObject dobj;
+	DumpableAcl dacl;
+	const char *rolname;
+	char	   *grptablespace;
+	char	   *grpoptions;		/* options specified by WITH (...) */
+} YbTablegroupInfo;
 
 typedef struct _tableAttachInfo
 {
@@ -396,6 +411,7 @@ typedef struct _indxInfo
 	int			indnattrs;		/* total number of index attributes */
 	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
 								 * contains both key and nonkey attributes */
+	Oid		   *indoptions;		/* Access flags for each column of the index */
 	bool		indisclustered;
 	bool		indisreplident;
 	bool		indnullsnotdistinct;
@@ -686,6 +702,7 @@ extern OprInfo *findOprByOid(Oid oid);
 extern CollInfo *findCollationByOid(Oid oid);
 extern NamespaceInfo *findNamespaceByOid(Oid oid);
 extern ExtensionInfo *findExtensionByOid(Oid oid);
+extern YbTablegroupInfo *findTablegroupByOid(Oid oid);
 extern PublicationInfo *findPublicationByOid(Oid oid);
 
 extern void recordExtensionMembership(CatalogId catId, ExtensionInfo *ext);
@@ -745,5 +762,7 @@ extern void getPublicationNamespaces(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 								 int numTables);
 extern void getSubscriptions(Archive *fout);
+
+extern YbTablegroupInfo *getTablegroups(Archive *fout, int *numTablegroups);
 
 #endif							/* PG_DUMP_H */

@@ -13,6 +13,8 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	ybplan.o \
+	\
 	appendinfo.o \
 	clauses.o \
 	inherit.o \

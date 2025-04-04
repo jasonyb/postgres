@@ -21,6 +21,100 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
+bool
+ShouldAcquireYBAdvisoryLocks()
+{
+	return IsYugaByteEnabled() && yb_enable_advisory_locks;
+}
+
+static void
+YbRaiseAdvisoryLocksNotSupported(void)
+{
+	if (!yb_silence_advisory_locks_not_supported_error)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("advisory locks feature is currently in preview"),
+				 errhint("To enable this preview feature, set the GFlag "
+						 "ysql_yb_enable_advisory_locks to true and add it to the list of "
+						 "allowed preview flags i.e. GFlag allowed_preview_flags_csv. "
+						 "If the app doesn't need strict functionality, this error can be silenced "
+						 "by using the GFlag yb_silence_advisory_locks_not_supported_error. "
+						 "See https://github.com/yugabyte/yugabyte-db/issues/3642 for details.")));
+}
+
+YbcAdvisoryLockId
+GetYBAdvisoryLockId(LOCKTAG tag)
+{
+	YbcAdvisoryLockId lock;
+
+	/* Current database oid. */
+	lock.database_id = tag.locktag_field1;
+	/* First of 2 int4 keys, or high-order half of an int8 key. */
+	lock.classid = tag.locktag_field2;
+	/* Second of 2 int4 keys, or low-order half of an int8 key. */
+	lock.objid = tag.locktag_field3;
+	/* 1 if using one int8 key. 2 if using two int4 keys. */
+	lock.objsubid = tag.locktag_field4;
+	return lock;
+}
+
+/*  Returns true if lock is released, false if lock is not found. */
+bool
+HandleStatusIgnoreLockNotFound(YbcStatus status, YbcAdvisoryLockMode mode)
+{
+	if (status && YBCStatusPgsqlError(status) == ERRCODE_YB_TXN_LOCK_NOT_FOUND)
+	{
+		const char *lock_type = (mode == YB_ADVISORY_LOCK_SHARED) ? "ShareLock" : "ExclusiveLock";
+		elog(WARNING, "you don't own a lock of type %s", lock_type);
+		YBCFreeStatus(status);
+		return false;
+	}
+	HandleYBStatus(status);
+	return true;
+}
+
+/*  Returns true if lock is acquired, false if lock is skipped. */
+bool
+HandleStatusIgnoreSkipLocking(YbcStatus status)
+{
+	if (status && YBCStatusPgsqlError(status) == ERRCODE_YB_TXN_SKIP_LOCKING)
+	{
+		YBCFreeStatus(status);
+		return false;
+	}
+	HandleYBStatus(status);
+	return true;
+}
+
+#define TryAcquireYBAdvisoryLock(tag, mode, session_level) \
+do { \
+	if (ShouldAcquireYBAdvisoryLocks()) \
+		PG_RETURN_BOOL(HandleStatusIgnoreSkipLocking(YBCAcquireAdvisoryLock( \
+			GetYBAdvisoryLockId(tag), mode, /* wait= */ false, session_level))); \
+	YbRaiseAdvisoryLocksNotSupported(); \
+} while(0)
+
+#define AcquireYBAdvisoryLock(tag, mode, session_level) \
+do { \
+	if (ShouldAcquireYBAdvisoryLocks()) \
+	{ \
+		HandleYBStatus(YBCAcquireAdvisoryLock( \
+			GetYBAdvisoryLockId(tag), mode, /* wait= */ true, session_level)); \
+		PG_RETURN_VOID(); \
+	} \
+	YbRaiseAdvisoryLocksNotSupported(); \
+} while(0)
+
+#define ReleaseYBAdvisoryLock(tag, mode) \
+do { \
+	if (ShouldAcquireYBAdvisoryLocks()) \
+		PG_RETURN_BOOL(HandleStatusIgnoreLockNotFound( \
+			YBCReleaseAdvisoryLock(GetYBAdvisoryLockId(tag), mode), mode)); \
+	YbRaiseAdvisoryLocksNotSupported(); \
+} while(0)
 
 /*
  * This must match enum LockTagType!  Also, be sure to document any changes
@@ -693,6 +787,7 @@ pg_advisory_lock_int8(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT64(tag, key);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE, /* session_level= */ true);
 
 	(void) LockAcquire(&tag, ExclusiveLock, true, false);
 
@@ -710,6 +805,7 @@ pg_advisory_xact_lock_int8(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT64(tag, key);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE, /* session_level= */ false);
 
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 
@@ -726,6 +822,7 @@ pg_advisory_lock_shared_int8(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT64(tag, key);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ true);
 
 	(void) LockAcquire(&tag, ShareLock, true, false);
 
@@ -743,6 +840,7 @@ pg_advisory_xact_lock_shared_int8(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT64(tag, key);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ false);
 
 	(void) LockAcquire(&tag, ShareLock, false, false);
 
@@ -762,6 +860,8 @@ pg_try_advisory_lock_int8(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE,
+							  /* session_level= */ true);
 
 	res = LockAcquire(&tag, ExclusiveLock, true, true);
 
@@ -782,6 +882,8 @@ pg_try_advisory_xact_lock_int8(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE,
+							  /* session_level= */ false);
 
 	res = LockAcquire(&tag, ExclusiveLock, false, true);
 
@@ -801,6 +903,7 @@ pg_try_advisory_lock_shared_int8(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ true);
 
 	res = LockAcquire(&tag, ShareLock, true, true);
 
@@ -821,6 +924,7 @@ pg_try_advisory_xact_lock_shared_int8(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ false);
 
 	res = LockAcquire(&tag, ShareLock, false, true);
 
@@ -840,6 +944,7 @@ pg_advisory_unlock_int8(PG_FUNCTION_ARGS)
 	bool		res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	ReleaseYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE);
 
 	res = LockRelease(&tag, ExclusiveLock, true);
 
@@ -859,6 +964,7 @@ pg_advisory_unlock_shared_int8(PG_FUNCTION_ARGS)
 	bool		res;
 
 	SET_LOCKTAG_INT64(tag, key);
+	ReleaseYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED);
 
 	res = LockRelease(&tag, ShareLock, true);
 
@@ -876,6 +982,7 @@ pg_advisory_lock_int4(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE, /* session_level= */ true);
 
 	(void) LockAcquire(&tag, ExclusiveLock, true, false);
 
@@ -894,6 +1001,7 @@ pg_advisory_xact_lock_int4(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE, /* session_level= */ false);
 
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
 
@@ -911,6 +1019,7 @@ pg_advisory_lock_shared_int4(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ true);
 
 	(void) LockAcquire(&tag, ShareLock, true, false);
 
@@ -929,6 +1038,8 @@ pg_advisory_xact_lock_shared_int4(PG_FUNCTION_ARGS)
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	AcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ false);
+
 
 	(void) LockAcquire(&tag, ShareLock, false, false);
 
@@ -949,6 +1060,8 @@ pg_try_advisory_lock_int4(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE,
+							  /* session_level= */ true);
 
 	res = LockAcquire(&tag, ExclusiveLock, true, true);
 
@@ -970,6 +1083,8 @@ pg_try_advisory_xact_lock_int4(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE,
+							  /* session_level= */ false);
 
 	res = LockAcquire(&tag, ExclusiveLock, false, true);
 
@@ -990,6 +1105,7 @@ pg_try_advisory_lock_shared_int4(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ true);
 
 	res = LockAcquire(&tag, ShareLock, true, true);
 
@@ -1011,6 +1127,7 @@ pg_try_advisory_xact_lock_shared_int4(PG_FUNCTION_ARGS)
 	LockAcquireResult res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	TryAcquireYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED, /* session_level= */ false);
 
 	res = LockAcquire(&tag, ShareLock, false, true);
 
@@ -1031,6 +1148,7 @@ pg_advisory_unlock_int4(PG_FUNCTION_ARGS)
 	bool		res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	ReleaseYBAdvisoryLock(tag, YB_ADVISORY_LOCK_EXCLUSIVE);
 
 	res = LockRelease(&tag, ExclusiveLock, true);
 
@@ -1051,6 +1169,7 @@ pg_advisory_unlock_shared_int4(PG_FUNCTION_ARGS)
 	bool		res;
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
+	ReleaseYBAdvisoryLock(tag, YB_ADVISORY_LOCK_SHARED);
 
 	res = LockRelease(&tag, ShareLock, true);
 
@@ -1063,6 +1182,12 @@ pg_advisory_unlock_shared_int4(PG_FUNCTION_ARGS)
 Datum
 pg_advisory_unlock_all(PG_FUNCTION_ARGS)
 {
+	if (ShouldAcquireYBAdvisoryLocks())
+	{
+		HandleYBStatus(YBCReleaseAllAdvisoryLocks(MyDatabaseId));
+		PG_RETURN_VOID();
+	}
+	YbRaiseAdvisoryLocksNotSupported();
 	LockReleaseSession(USER_LOCKMETHOD);
 
 	PG_RETURN_VOID();

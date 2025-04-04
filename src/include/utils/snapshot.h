@@ -122,6 +122,12 @@ typedef struct SnapshotData *Snapshot;
 
 #define InvalidSnapshot		((Snapshot) NULL)
 
+typedef struct YbReadTimePointHandle
+{
+	bool		has_value;
+	uint64		value;
+} YbReadTimePointHandle;
+
 /*
  * Struct representing all kind of possible snapshots.
  *
@@ -214,6 +220,17 @@ typedef struct SnapshotData
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+	YbReadTimePointHandle yb_read_time_point_handle;
+
+	/*
+	 * This field is only applicable if the snapshot is being used for logical
+	 * replication (CDC) purposes. It is the consistent snapshot read time
+	 * received from cdc service. It is used as the read time while
+	 * exporting/setting the snapshot. Its has_value to false when the read time
+	 * to be stored is to be picked from tserver (i.e. pg_export_snapshot or SET
+	 * TRANSACTION SNAPSHOT) or when Yugabyte is not enabled.
+	 */
+	YbReadTimePointHandle yb_cdc_snapshot_read_time;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

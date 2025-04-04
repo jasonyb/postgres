@@ -58,6 +58,12 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 
+/* YB includes */
+#include "catalog/pg_constraint.h"
+#include "commands/yb_cmds.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/planner.h"
+
 /*
  * This struct is used to pass around the information on tables to be
  * clustered. We need this so we can make a list of them when invoked without
@@ -475,7 +481,6 @@ cluster_rel(Oid tableOid, Oid indexOid, ClusterParams *params)
 	rebuild_relation(OldHeap, indexOid, verbose);
 
 	/* NB: rebuild_relation does table_close() on OldHeap */
-
 out:
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -655,7 +660,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	OIDNewHeap = make_new_heap(tableOid, tableSpace,
 							   accessMethod,
 							   relpersistence,
-							   AccessExclusiveLock);
+							   AccessExclusiveLock,
+							   true /* yb_copy_split_options */ );
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_table_data(OIDNewHeap, tableOid, indexOid, verbose,
@@ -668,7 +674,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
 					 swap_toast_by_content, false, true,
 					 frozenXid, cutoffMulti,
-					 relpersistence);
+					 relpersistence,
+					 true /* yb_copy_split_options */ );
 }
 
 
@@ -681,10 +688,12 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
  *
  * After this, the caller should load the new heap with transferred/modified
  * data, then call finish_heap_swap to complete the operation.
+ * YB Note: In YB, this function is used during table rewrite operations.
  */
 Oid
 make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
-			  char relpersistence, LOCKMODE lockmode)
+			  char relpersistence, LOCKMODE lockmode,
+			  bool yb_copy_split_options)
 {
 	TupleDesc	OldHeapDesc;
 	char		NewHeapName[NAMEDATALEN];
@@ -739,6 +748,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 	OIDNewHeap = heap_create_with_catalog(NewHeapName,
 										  namespaceid,
 										  NewTableSpace,
+										  InvalidOid,	/* reltablegroup */
 										  InvalidOid,
 										  InvalidOid,
 										  InvalidOid,
@@ -756,8 +766,14 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, Oid NewAccessMethod,
 										  true,
 										  true,
 										  OIDOldHeap,
-										  NULL);
+										  NULL,
+										  false);
 	Assert(OIDNewHeap != InvalidOid);
+
+	if (IsYugaByteEnabled() && relpersistence != RELPERSISTENCE_TEMP)
+		YbRelationSetNewRelfileNode(OldHeap, OIDNewHeap,
+									yb_copy_split_options,
+									false /* is_truncate */ );
 
 	ReleaseSysCache(tuple);
 
@@ -1106,6 +1122,19 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		relform1->relpersistence = relform2->relpersistence;
 		relform2->relpersistence = swptmpchr;
 
+		if (IsYugaByteEnabled())
+		{
+			/*
+			 * If this swap is happening during a REFRESH MATVIEW,
+			 * correctly mark the transient relation as a MATVIEW
+			 * so that it is dropped in YB mode.
+			 */
+			if (relform1->relkind == RELKIND_MATVIEW)
+				relform2->relkind = RELKIND_MATVIEW;
+			else if (relform2->relkind == RELKIND_MATVIEW)
+				relform1->relkind = RELKIND_MATVIEW;
+		}
+
 		/* Also swap toast links, if we're swapping by links */
 		if (!swap_toast_by_content)
 		{
@@ -1421,7 +1450,8 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool is_internal,
 				 TransactionId frozenXid,
 				 MultiXactId cutoffMulti,
-				 char newrelpersistence)
+				 char newrelpersistence,
+				 bool yb_copy_split_options)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
@@ -1484,7 +1514,9 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
 								 PROGRESS_CLUSTER_PHASE_REBUILD_INDEX);
 
-	reindex_relation(OIDOldHeap, reindex_flags, &reindex_params);
+	reindex_relation(OIDOldHeap, reindex_flags, &reindex_params,
+					 true /* is_yb_table_rewrite */ ,
+					 yb_copy_split_options);
 
 	/* Report that we are now doing clean up */
 	pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
@@ -1532,7 +1564,8 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 * The new relation is local to our transaction and we know nothing
 	 * depends on it, so DROP_RESTRICT should be OK.
 	 */
-	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+	if (!(IsYugaByteEnabled() && yb_test_table_rewrite_keep_old_table))
+		performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
 
 	/* performDeletion does CommandCounterIncrement at end */
 

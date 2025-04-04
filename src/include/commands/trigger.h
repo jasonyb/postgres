@@ -18,6 +18,9 @@
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 
+/* YB includes */
+#include "utils/yb_tuplecache.h"
+
 /*
  * TriggerData is the node type that is passed as fmgr "context" info
  * when a function is called by the trigger manager.
@@ -41,6 +44,7 @@ typedef struct TriggerData
 	Tuplestorestate *tg_oldtable;
 	Tuplestorestate *tg_newtable;
 	const Bitmapset *tg_updatedcols;
+	EState	   *estate;
 } TriggerData;
 
 /*
@@ -176,7 +180,7 @@ extern void EnableDisableTriggerNew(Relation rel, const char *tgname,
 extern void EnableDisableTrigger(Relation rel, const char *tgname,
 								 char fires_when, bool skip_system, LOCKMODE lockmode);
 
-extern void RelationBuildTriggers(Relation relation);
+extern void RelationBuildTriggers(Relation relation, const YbTupleCache *yb_pg_trigger_cache);
 
 extern TriggerDesc *CopyTriggerDesc(TriggerDesc *trigdesc);
 
@@ -269,13 +273,18 @@ extern bool AfterTriggerPendingOnRel(Oid relid);
  * in utils/adt/ri_triggers.c
  */
 extern bool RI_FKey_pk_upd_check_required(Trigger *trigger, Relation pk_rel,
-										  TupleTableSlot *old_slot, TupleTableSlot *new_slot);
+										  TupleTableSlot *old_slot, TupleTableSlot *new_slot,
+										  const YbSkippableEntities *yb_skip_entities);
 extern bool RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
-										  TupleTableSlot *old_slot, TupleTableSlot *new_slot);
+										  TupleTableSlot *old_slot, TupleTableSlot *new_slot,
+										  const YbSkippableEntities *yb_skip_entities);
 extern bool RI_Initial_Check(Trigger *trigger,
 							 Relation fk_rel, Relation pk_rel);
 extern void RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel,
 									 Relation pk_rel);
+extern void YbAddTriggerFKReferenceIntent(Trigger *trigger, Relation fk_rel,
+										  TupleTableSlot *new_slot,
+										  EState *estate, bool is_deferred);
 
 /* result values for RI_FKey_trigger_type: */
 #define RI_TRIGGER_PK	1		/* is a trigger on the PK relation */
@@ -283,5 +292,8 @@ extern void RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel,
 #define RI_TRIGGER_NONE 0		/* is not an RI trigger function */
 
 extern int	RI_FKey_trigger_type(Oid tgfoid);
+
+/* Return true if the trigger description has non FK trigger. */
+extern bool HasNonRITrigger(const TriggerDesc *trigDesc);
 
 #endif							/* TRIGGER_H */

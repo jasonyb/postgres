@@ -35,6 +35,9 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* ----------
  * Our own local and global variables
  * ----------
@@ -171,8 +174,9 @@ recheck:
 	if (function)
 	{
 		/* We have a compiled function, but is it still valid? */
-		if (function->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
-			ItemPointerEquals(&function->fn_tid, &procTup->t_self))
+		if (IsYugaByteEnabled() ? function->yb_catalog_version == YBGetActiveCatalogCacheVersion() :
+			(function->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
+			 ItemPointerEquals(&function->fn_tid, &procTup->t_self)))
 			function_valid = true;
 		else
 		{
@@ -370,6 +374,7 @@ do_compile(FunctionCallInfo fcinfo,
 
 	function->nstatements = 0;
 	function->requires_procedure_resowner = false;
+	function->yb_catalog_version = YBGetActiveCatalogCacheVersion();
 
 	/*
 	 * Initialize the compiler, particularly the namespace stack.  The
@@ -2428,6 +2433,7 @@ plpgsql_add_initdatums(int **varnos)
 					case PLPGSQL_DTYPE_VAR:
 					case PLPGSQL_DTYPE_REC:
 						(*varnos)[n++] = plpgsql_Datums[i]->dno;
+						switch_fallthrough();
 
 					default:
 						break;

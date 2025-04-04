@@ -257,7 +257,7 @@ MultiExecParallelHash(HashState *node)
 			 * way, wait for everyone to arrive here so we can proceed.
 			 */
 			BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_BUILD_HASHING_INNER:
 
@@ -1205,13 +1205,13 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				/* All other participants just flush their tuples to disk. */
 				ExecParallelHashCloseBatchAccessors(hashtable);
 			}
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BATCHES_ALLOCATING:
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
 								 WAIT_EVENT_HASH_GROW_BATCHES_ALLOCATE);
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BATCHES_REPARTITIONING:
 			/* Make sure that we have the current dimensions and buckets. */
@@ -1224,7 +1224,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
 								 WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION);
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BATCHES_DECIDING:
 
@@ -1279,7 +1279,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				dsa_free(hashtable->area, pstate->old_batches);
 				pstate->old_batches = InvalidDsaPointer;
 			}
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BATCHES_FINISHING:
 			/* Wait for the above to complete. */
@@ -1557,13 +1557,13 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
 				/* Clear the flag. */
 				pstate->growth = PHJ_GROWTH_OK;
 			}
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BUCKETS_ALLOCATING:
 			/* Wait for the above to complete. */
 			BarrierArriveAndWait(&pstate->grow_buckets_barrier,
 								 WAIT_EVENT_HASH_GROW_BUCKETS_ALLOCATE);
-			/* Fall through. */
+			switch_fallthrough();
 
 		case PHJ_GROW_BUCKETS_REINSERTING:
 			/* Reinsert all tuples into the hash table. */

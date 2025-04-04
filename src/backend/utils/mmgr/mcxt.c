@@ -30,6 +30,162 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "commands/explain.h"
+#include "funcapi.h"
+#include "pg_yb_utils.h"
+#include "pgstat.h"
+#include "utils/builtins.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+#ifndef __linux__
+#include <libproc.h>
+#else
+#include <stdio.h>
+#include <unistd.h>
+#endif
+
+YbPgMemTracker PgMemTracker = {0};
+
+/*
+ * A helper function to take snapshot of current memory usage.
+ * It includes current PG memory usage plus current Tcmalloc usage by
+ * pggate.
+ * Extracting PgGate memory consumption is platform dependent.
+ * Only using PG's memory context's consumption and skip collecting pggate's
+ * memory consumption when TCmalloc is not enabled. This will miss PgGate's
+ * memory consumption but it still shows a major portion of memory consumption
+ * during an execution.
+ */
+static Size
+YbSnapshotMemory()
+{
+#if YB_TCMALLOC_ENABLED
+	return YBCGetPgggateCurrentAllocatedBytes();
+#else
+	return PgMemTracker.pg_cur_mem_bytes;
+#endif
+}
+
+/*
+ * Update current memory usage in MemTracker, when there is no PG
+ * memory allocation activities.
+ */
+static void
+YbPgMemUpdateMax()
+{
+	const Size	snapshot_mem = YbSnapshotMemory();
+
+	PgMemTracker.stmt_max_mem_bytes =
+		Max(PgMemTracker.stmt_max_mem_bytes,
+			snapshot_mem - PgMemTracker.stmt_max_mem_base_bytes);
+}
+
+/*
+ * Update the current actual heap memory usage in MemTracker by getting
+ * the value from the root MemTracker's consumption
+ */
+static void
+YbPgMemUpdateCur()
+{
+#if YB_TCMALLOC_ENABLED
+	PgMemTracker.backend_cur_allocated_mem_bytes = YBCGetActualHeapSizeBytes();
+	yb_pgstat_report_allocated_mem_bytes();
+#endif
+}
+
+int64_t
+YbPgGetCurRSSMemUsage(int pid)
+{
+	if (!yb_enable_memory_tracking)
+		return -1;
+#ifdef __linux__
+	uint64		resident = 0;
+	char		path[20];
+
+	snprintf(path, 20, "/proc/%d/statm", pid);
+	FILE	   *fp = fopen(path, "r");
+
+	if (fp == NULL)
+		return -1;				/* Can't open */
+
+	if (fscanf(fp, "%*s%lu", &resident) != 1)
+	{
+		fclose(fp);
+		return -1;				/* Can't read */
+	}
+	fclose(fp);
+	return resident * sysconf(_SC_PAGESIZE);
+#else
+	struct proc_taskallinfo info;
+	int			result = proc_pidinfo(pid, PROC_PIDTASKALLINFO, 0, &info,
+									  sizeof(struct proc_taskallinfo));
+
+	if (result == 0 || result < sizeof(info))
+		return -1;				/* Can't be determined or wrong value */
+
+	return info.ptinfo.pti_resident_size;
+#endif
+}
+
+void
+YbPgMemAddConsumption(Size sz)
+{
+	if (!yb_enable_memory_tracking)
+		return;
+
+	if (IsMultiThreadedMode())
+		return;
+
+	PgMemTracker.pg_cur_mem_bytes += sz;
+	/*
+	 * Try to track PG's memory consumption by the root MemTracker.
+	 * Consume the current PG's memory consumption instead the sz bytes since
+	 * the root MemTracker is initiated, to compensate the missed memory
+	 * consumption since the process starts.
+	 */
+	PgMemTracker.pggate_alive = YBCTryMemConsume(PgMemTracker.pggate_alive ?
+												 sz :
+												 PgMemTracker.pg_cur_mem_bytes);
+
+	if (yb_run_with_explain_analyze)
+		/* Only update max memory when memory is increasing */
+		YbPgMemUpdateMax();
+
+	/* Update current heap memory usage */
+	YbPgMemUpdateCur();
+}
+
+void
+YbPgMemSubConsumption(Size sz)
+{
+	if (!yb_enable_memory_tracking)
+		return;
+
+	if (IsMultiThreadedMode())
+		return;
+
+	/* Avoid overflow when subtracting sz. */
+	PgMemTracker.pg_cur_mem_bytes = (PgMemTracker.pg_cur_mem_bytes >= sz ?
+									 PgMemTracker.pg_cur_mem_bytes - sz :
+									 0);
+	/*
+	 * Only call release if pggate is alive, and update its liveness from the
+	 * return value.
+	 */
+	if (PgMemTracker.pggate_alive)
+		PgMemTracker.pggate_alive = YBCTryMemRelease(sz);
+
+	/* Update current heap memory usage */
+	YbPgMemUpdateCur();
+}
+
+void
+YbPgMemResetStmtConsumption()
+{
+	PgMemTracker.stmt_max_mem_base_bytes =
+		yb_run_with_explain_analyze ? YbSnapshotMemory() : 0;
+	PgMemTracker.stmt_max_mem_bytes = 0;
+}
 
 /*****************************************************************************
  *	  GLOBAL MEMORY															 *
@@ -38,8 +194,62 @@
 /*
  * CurrentMemoryContext
  *		Default memory context for allocations.
+ *
+ * YB: rename upstream PG's CurrentMemoryContext to YbCurrentMemoryContext (for
+ * explanation, see comment for the header declaration of this).
  */
-MemoryContext CurrentMemoryContext = NULL;
+MemoryContext YbCurrentMemoryContext = NULL;
+
+
+MemoryContext
+GetThreadLocalCurrentMemoryContext()
+{
+	return (MemoryContext) YBCPgGetThreadLocalCurrentMemoryContext();
+}
+
+MemoryContext
+SetThreadLocalCurrentMemoryContext(MemoryContext memctx)
+{
+	return (MemoryContext) YBCPgSetThreadLocalCurrentMemoryContext(memctx);
+}
+
+MemoryContext
+CreateThreadLocalCurrentMemoryContext(MemoryContext parent,
+									  const char *name)
+{
+	return AllocSetContextCreateInternal(parent, name, ALLOCSET_START_SMALL_SIZES);
+}
+
+void
+PrepareThreadLocalCurrentMemoryContext()
+{
+	if (YBCPgGetThreadLocalCurrentMemoryContext() == NULL)
+	{
+		MemoryContext memctx = AllocSetContextCreate((MemoryContext) NULL,
+													 "DocDBExprMemoryContext",
+													 ALLOCSET_START_SMALL_SIZES);
+
+		YBCPgSetThreadLocalCurrentMemoryContext(memctx);
+	}
+}
+
+void
+ResetThreadLocalCurrentMemoryContext()
+{
+	MemoryContext memctx = (MemoryContext) YBCPgGetThreadLocalCurrentMemoryContext();
+
+	YBCPgResetCurrentMemCtxThreadLocalVars();
+	MemoryContextReset(memctx);
+}
+
+void
+DeleteThreadLocalCurrentMemoryContext()
+{
+	MemoryContext memctx = (MemoryContext) YBCPgSetThreadLocalCurrentMemoryContext(NULL);
+
+	YBCPgResetCurrentMemCtxThreadLocalVars();
+	MemoryContextDelete(memctx);
+}
 
 /*
  * Standard top-level contexts. For a description of the purpose of each
@@ -73,6 +283,11 @@ static void MemoryContextStatsPrint(MemoryContext context, void *passthru,
 #define AssertNotInCriticalSection(context) \
 	Assert(CritSectionCount == 0 || (context)->allowInCritSection)
 
+/* ----------
+ * The max bytes for showing identifiers of MemoryContext.
+ * ----------
+ */
+#define MEMORY_CONTEXT_IDENT_DISPLAY_SIZE	1024
 
 /*****************************************************************************
  *	  EXPORTED ROUTINES														 *
@@ -111,7 +326,7 @@ MemoryContextInit(void)
 	 * Not having any other place to point CurrentMemoryContext, make it point
 	 * to TopMemoryContext.  Caller should change this soon!
 	 */
-	CurrentMemoryContext = TopMemoryContext;
+	YbCurrentMemoryContext = TopMemoryContext;
 
 	/*
 	 * Initialize ErrorContext as an AllocSetContext with slow growth rate ---
@@ -148,8 +363,13 @@ MemoryContextReset(MemoryContext context)
 	if (context->firstchild != NULL)
 		MemoryContextDeleteChildren(context);
 
-	/* save a function call if no pallocs since startup or last reset */
-	if (!context->isReset)
+	/*
+	 * Save a function call if no pallocs since startup or last reset.
+	 * NOTE: When "yb_memctx" is not null, ResetOnly() must be called to inform YugaByte code layer
+	 * that resetting is happening. While the state variable "isReset" controls the objects in
+	 * Postgres, and the opaque object "yb_memctx" controls YugaByte objects.
+	 */
+	if (context->yb_memctx || !context->isReset)
 		MemoryContextResetOnly(context);
 }
 
@@ -162,6 +382,15 @@ void
 MemoryContextResetOnly(MemoryContext context)
 {
 	AssertArg(MemoryContextIsValid(context));
+
+	/*
+	 * Reset YugaByte context also.
+	 * Currently reset YugaByte context does not destroy it.  Maybe we should?
+	 */
+	if (context->yb_memctx)
+	{
+		HandleYBStatus(YBCPgResetMemctx(context->yb_memctx));
+	}
 
 	/* Nothing to do if no pallocs since startup or last reset */
 	if (!context->isReset)
@@ -180,6 +409,7 @@ MemoryContextResetOnly(MemoryContext context)
 
 		context->methods->reset(context);
 		context->isReset = true;
+
 		VALGRIND_DESTROY_MEMPOOL(context);
 		VALGRIND_CREATE_MEMPOOL(context, 0, false);
 	}
@@ -248,6 +478,13 @@ MemoryContextDelete(MemoryContext context)
 	 * (already unlinked) context, which is unlikely, but let's be safe.
 	 */
 	context->ident = NULL;
+
+	/*
+	 * Destroy YugaByte memory context.
+	 */
+	if (context->yb_memctx)
+		HandleYBStatus(YBCPgDestroyMemctx(context->yb_memctx));
+	context->yb_memctx = NULL;
 
 	context->methods->delete_context(context);
 
@@ -554,6 +791,23 @@ MemoryContextStatsDetail(MemoryContext context, int max_children,
 }
 
 /*
+ * MemoryContextStatsUsage
+ *
+ * Entry point for use if you want to find total usage without looking into details.
+ */
+int64
+MemoryContextStatsUsage(MemoryContext context, int max_children)
+{
+	MemoryContextCounters grand_totals;
+
+	memset(&grand_totals, 0, sizeof(grand_totals));
+
+	MemoryContextStatsInternal(context, 0, false, max_children, &grand_totals, true);
+
+	return (grand_totals.totalspace - grand_totals.freespace);
+}
+
+/*
  * MemoryContextStatsInternal
  *		One recursion level for MemoryContextStats
  *
@@ -832,6 +1086,9 @@ MemoryContextCreate(MemoryContext node,
 	node->name = name;
 	node->ident = NULL;
 	node->reset_cbs = NULL;
+
+	/* YugaByte memory context handler */
+	node->yb_memctx = NULL;
 
 	/* OK to link node into context tree */
 	if (parent)
@@ -1338,4 +1595,24 @@ pchomp(const char *in)
 	while (n > 0 && in[n - 1] == '\n')
 		n--;
 	return pnstrdup(in, n);
+}
+
+/*
+ * Get the YugaByte current memory context.
+ */
+YbcPgMemctx
+GetCurrentYbMemctx()
+{
+	MemoryContext context = CurrentMemoryContext;
+
+	AssertArg(MemoryContextIsValid(context));
+	AssertNotInCriticalSection(context);
+
+	if (context->yb_memctx == NULL)
+	{
+		/* Create the yugabyte context if this is the first time it is used. */
+		context->yb_memctx = YBCPgCreateMemctx();
+	}
+
+	return context->yb_memctx;
 }

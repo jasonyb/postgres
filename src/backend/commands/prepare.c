@@ -37,6 +37,10 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 
 /*
  * The hash table in which prepared queries are stored. This is
@@ -136,6 +140,19 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	StorePreparedStatement(stmt->name,
 						   plansource,
 						   true);
+
+	if (YbIsClientYsqlConnMgr())
+	{
+		/*
+		 * PREPARE statements (do not consider protocol-level prepared statements)
+		 * are not tracked by ysql connection manager.
+		 * EXECUTE statement should be forwarded on the same connection on
+		 * which PREPARE statement is executed, therefore the connection should be
+		 * made sticky.
+		 */
+		increment_sticky_object_count();
+		elog(LOG, "Incrementing sticky object count for prepared statement %s", stmt->name);
+	}
 }
 
 /*
@@ -168,6 +185,15 @@ ExecuteQuery(ParseState *pstate,
 	/* Shouldn't find a non-fixed-result cached plan */
 	if (!entry->plansource->fixed_result)
 		elog(ERROR, "EXECUTE does not support variable-result cached plans");
+
+	/*
+	 * If the planner found a pg relation in this plan, set the appropriate
+	 * flag for the execution txn.
+	 */
+	if (entry->plansource->usesPostgresRel)
+	{
+		YbSetTxnWithPgOps(YB_TXN_USES_TEMPORARY_RELATIONS);
+	}
 
 	/* Evaluate parameters, if any */
 	if (entry->plansource->num_params > 0)

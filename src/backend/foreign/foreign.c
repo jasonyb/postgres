@@ -8,6 +8,22 @@
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugaByte development.
+ *
+ * Portions Copyright (c) YugaByte, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -28,6 +44,10 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+/* YB includes */
+#include "executor/yb_fdw.h"
+#include "pg_yb_utils.h"
 
 
 /*
@@ -442,8 +462,16 @@ GetFdwRoutineForRelation(Relation relation, bool makecopy)
 
 	if (relation->rd_fdwroutine == NULL)
 	{
-		/* Get the info by consulting the catalogs and the FDW code */
-		fdwroutine = GetFdwRoutineByRelId(RelationGetRelid(relation));
+		if (IsYBRelation(relation))
+		{
+			/* Get the custom YB FDW directly */
+			fdwroutine = (FdwRoutine *) yb_fdw_handler();
+		}
+		else
+		{
+			/* Get the info by consulting the catalogs and the FDW code */
+			fdwroutine = GetFdwRoutineByRelId(RelationGetRelid(relation));
+		}
 
 		/* Save the data for later reuse in CacheMemoryContext */
 		cfdwroutine = (FdwRoutine *) MemoryContextAlloc(CacheMemoryContext,
@@ -753,6 +781,7 @@ GetExistingLocalJoinPath(RelOptInfo *joinrel)
 				break;
 
 			case T_NestLoop:
+			case T_YbBatchedNestLoop:
 				{
 					NestPath   *nest_path = makeNode(NestPath);
 

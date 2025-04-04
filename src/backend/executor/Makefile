@@ -13,6 +13,16 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	nodeYbBatchedNestloop.o \
+	nodeYbBitmapIndexscan.o \
+	nodeYbBitmapTablescan.o \
+	nodeYbSeqscan.o \
+	ybExpr.o \
+	ybFunction.o \
+	ybModifyTable.o \
+	ybOptimizeModifyTable.o \
+	yb_fdw.o \
+	\
 	execAmi.o \
 	execAsync.o \
 	execCurrent.o \

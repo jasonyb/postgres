@@ -55,6 +55,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+#include "pg_yb_utils.h"
+
 /* GUC parameter */
 int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
 
@@ -151,7 +155,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary or unlogged relations during recovery")));
 
-	rel->min_attr = FirstLowInvalidHeapAttributeNumber + 1;
+	rel->min_attr = YBGetFirstLowInvalidAttributeNumber(relation) + 1;
 	rel->max_attr = RelationGetNumberOfAttributes(relation);
 	rel->reltablespace = RelationGetForm(relation)->reltablespace;
 
@@ -263,6 +267,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->rel = rel;
 			info->ncolumns = ncolumns = index->indnatts;
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
+			info->nhashcolumns = 0;
 
 			info->indexkeys = (int *) palloc(sizeof(int) * ncolumns);
 			info->indexcollations = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
@@ -295,9 +300,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->amhasgettuple = (amroutine->amgettuple != NULL);
 			info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
 				relation->rd_tableam->scan_bitmap_next_block != NULL;
+			info->yb_amhasgetbitmap = (amroutine->yb_amgetbitmap != NULL);
 			info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 								  amroutine->amrestrpos != NULL);
 			info->amcostestimate = amroutine->amcostestimate;
+			info->yb_amiscopartitioned = amroutine->yb_amiscopartitioned;
+			info->yb_cached_ybctid_size = 0;
 			Assert(info->amcostestimate != NULL);
 
 			/* Fetch index opclass options */
@@ -354,8 +362,17 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					Oid			btopcintype;
 					int16		btstrategy;
 
-					info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
-					info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					if (IsYBRelation(relation) && (opt & INDOPTION_HASH) != 0)
+					{
+						info->nhashcolumns++;
+						info->reverse_sort[i] = false;
+						info->nulls_first[i] = false;
+					}
+					else
+					{
+						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
+						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					}
 
 					ltopr = get_opfamily_member(info->opfamily[i],
 												info->opcintype[i],
@@ -418,7 +435,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * a table, except we can be sure that the index is not larger
 			 * than the table.
 			 */
-			if (info->indpred == NIL)
+			if (info->indpred == NIL && !IsYBRelation(indexRelation))
 			{
 				info->pages = RelationGetNumberOfBlocks(indexRelation);
 				info->tuples = rel->tuples;
@@ -996,7 +1013,25 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	BlockNumber relallvisible;
 	double		density;
 
-	if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	/*
+	 * TODO We don't support forwarding size estimates to postgres yet.
+	 * Use whatever is in pg_class.
+	 */
+	if (IsYBRelation(rel))
+	{
+		if (rel->rd_rel->reltuples < 0)
+		{
+			*tuples = YBC_DEFAULT_NUM_ROWS;
+		}
+		else
+		{
+			*tuples = rel->rd_rel->reltuples;
+		}
+
+		*pages = rel->rd_rel->relpages;
+		*allvisfrac = 0;
+	}
+	else if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{
 		table_relation_estimate_size(rel, attr_widths, pages, tuples,
 									 allvisfrac);
@@ -2241,19 +2276,26 @@ has_stored_generated_columns(PlannerInfo *root, Index rti)
  * that depend on any column listed in target_cols.  Both the input and
  * result bitmapsets contain column numbers offset by
  * FirstLowInvalidHeapAttributeNumber.
+ *
+ * YB note: The out param yb_generated_cols_source contains a set of columns
+ * that the returned generated columns depend on. These independent columns may
+ * not be a part of target_cols.
  */
 Bitmapset *
 get_dependent_generated_columns(PlannerInfo *root, Index rti,
-								Bitmapset *target_cols)
+								Bitmapset *target_cols,
+								Bitmapset **yb_generated_cols_source)
 {
 	Bitmapset  *dependentCols = NULL;
 	RangeTblEntry *rte = planner_rt_fetch(rti, root);
 	Relation	relation;
 	TupleDesc	tupdesc;
 	TupleConstr *constr;
+	AttrNumber	min_attr;
 
 	/* Assume we already have adequate lock */
 	relation = table_open(rte->relid, NoLock);
+	min_attr = YBGetFirstLowInvalidAttributeNumber(relation);
 
 	tupdesc = RelationGetDescr(relation);
 	constr = tupdesc->constr;
@@ -2272,11 +2314,17 @@ get_dependent_generated_columns(PlannerInfo *root, Index rti,
 
 			/* identify columns this generated column depends on */
 			expr = stringToNode(defval->adbin);
-			pull_varattnos(expr, 1, &attrs_used);
+			pull_varattnos_min_attr(expr, 1, &attrs_used, min_attr + 1);
 
 			if (bms_overlap(target_cols, attrs_used))
+			{
 				dependentCols = bms_add_member(dependentCols,
-											   defval->adnum - FirstLowInvalidHeapAttributeNumber);
+											   defval->adnum - min_attr);
+
+				if (yb_generated_cols_source)
+					*yb_generated_cols_source = bms_add_members(*yb_generated_cols_source,
+																attrs_used);
+			}
 		}
 	}
 

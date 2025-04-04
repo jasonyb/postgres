@@ -38,6 +38,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+#include <pg_yb_utils.h>
+
 
 /* ----------------------------------------------------------------
  *		general access method routines
@@ -126,6 +130,20 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	scan->xs_hitup = NULL;
 	scan->xs_hitupdesc = NULL;
 
+	/*
+	 * Upstream PG commit c2fe139c201c48f1133e9fbea2dd99b8efe2fadd removes
+	 * setting the item pointer invalid.  Bring that back for the sake of YB
+	 * asserts that that PG field is not changed in YB logic.
+	 */
+	ItemPointerSetInvalid(&scan->xs_heaptid);
+	scan->yb_exec_params = NULL;
+	scan->yb_scan_plan = NULL;
+	scan->yb_rel_pushdown = NULL;
+	scan->yb_idx_pushdown = NULL;
+	scan->yb_aggrefs = NIL;
+	scan->yb_agg_slot = NULL;
+	scan->yb_distinct_prefixlen = 0;
+	scan->fetch_ybctids_only = false;
 	return scan;
 }
 
@@ -392,6 +410,14 @@ systable_beginscan(Relation heapRelation,
 	SysScanDesc sysscan;
 	Relation	irel;
 
+	if (IsYugaByteEnabled())
+		return ybc_systable_beginscan(heapRelation,
+									  indexId,
+									  indexOK,
+									  snapshot,
+									  nkeys,
+									  key);
+
 	if (indexOK &&
 		!IgnoreSystemIndexes &&
 		!ReindexIsProcessingIndex(indexId))
@@ -506,6 +532,11 @@ systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup = NULL;
 
+	YbSysScanBase ybscan = sysscan->ybscan;
+
+	if (ybscan)
+		return ybscan->vtable->next(ybscan);
+
 	if (sysscan->irel)
 	{
 		if (index_getnext_slot(sysscan->iscan, ForwardScanDirection, sysscan->slot))
@@ -563,6 +594,13 @@ systable_getnext(SysScanDesc sysscan)
 bool
 systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 {
+	/*
+	 * If YugaByte is enabled, systable_recheck_tuple doesn't work
+	 * since the function uses the buffer to determine the tuple's visibility.
+	 */
+	if (IsYugaByteEnabled())
+		return true;
+
 	Snapshot	freshsnap;
 	bool		result;
 
@@ -597,6 +635,11 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
+	YbSysScanBase ybscan = sysscan->ybscan;
+
+	if (ybscan)
+		return ybscan->vtable->end(ybscan);
+
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -640,6 +683,8 @@ systable_endscan(SysScanDesc sysscan)
  * wrappers around index_beginscan/index_getnext_slot.  The main reason for
  * their existence is to centralize possible future support of lossy operators
  * in catalog scans.
+ * TODO: This is not yet formally supported in YB, but cannot disable it
+ *       because it is used for enum types (see issues #6259).
  */
 SysScanDesc
 systable_beginscan_ordered(Relation heapRelation,

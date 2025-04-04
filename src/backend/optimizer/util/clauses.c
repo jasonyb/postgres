@@ -154,6 +154,17 @@ static Node *substitute_actual_srf_parameters_mutator(Node *node,
 													  substitute_actual_srf_parameters_context *context);
 static bool pull_paramids_walker(Node *node, Bitmapset **context);
 
+/*****************************************************************************
+ *		ScalarArrayOperator clause functions
+ *****************************************************************************/
+
+Node *
+yb_get_saop_left_op(const Expr *clause)
+{
+	const ScalarArrayOpExpr *expr = (const ScalarArrayOpExpr *) clause;
+
+	return linitial(expr->args);
+}
 
 /*****************************************************************************
  *		Aggregate-function clause manipulation
@@ -1191,6 +1202,12 @@ contain_leaked_vars_walker(Node *node, void *context)
 			 */
 			break;
 
+		case T_YbBatchedExpr:
+			{
+				contain_leaked_vars_walker((Node *) ((YbBatchedExpr *) node)->orig_expr,
+										   context);
+				break;
+			}
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -1243,7 +1260,7 @@ contain_leaked_vars_walker(Node *node, void *context)
 
 				forthree(opid, rcexpr->opnos,
 						 larg, rcexpr->largs,
-						 rarg, rcexpr->rargs)
+						 rarg, castNode(List, rcexpr->rargs))
 				{
 					Oid			funcid = get_opcode(lfirst_oid(opid));
 
@@ -1422,7 +1439,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 				 * the intersection of the sets of nonnullable rels, just as
 				 * for OR.  Fall through to share code.
 				 */
-				/* FALL THRU */
+				switch_fallthrough();
 			case OR_EXPR:
 
 				/*
@@ -1647,7 +1664,7 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 				 * the intersection of the sets of nonnullable vars, just as
 				 * for OR.  Fall through to share code.
 				 */
-				/* FALL THRU */
+				switch_fallthrough();
 			case OR_EXPR:
 
 				/*
@@ -5252,4 +5269,46 @@ pull_paramids_walker(Node *node, Bitmapset **context)
 	}
 	return expression_tree_walker(node, pull_paramids_walker,
 								  (void *) context);
+}
+
+typedef struct
+{
+	Index		oldvarno;
+	Index		newvarno;
+} yb_replace_varnos_context;
+
+static Node *
+yb_copy_replace_varnos_mutator(Node *node,
+							   yb_replace_varnos_context *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varno == context->oldvarno)
+		{
+			Var		   *newvar = copyObject(var);
+
+			newvar->varno = context->newvarno;
+			return (Node *) newvar;
+		}
+	}
+
+	return expression_tree_mutator(node,
+								   yb_copy_replace_varnos_mutator,
+								   (void *) context);
+}
+
+Expr *
+yb_copy_replace_varnos(Expr *expr, Index oldvarno, Index newvarno)
+{
+	yb_replace_varnos_context ctx;
+
+	ctx.oldvarno = oldvarno;
+	ctx.newvarno = newvarno;
+	return (Expr *) yb_copy_replace_varnos_mutator((Node *) expr,
+												   (void *) &ctx);
 }

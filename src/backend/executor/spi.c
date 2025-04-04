@@ -35,6 +35,9 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * These global variables are part of the API for various SPI functions
@@ -1153,6 +1156,7 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 		 */
 		mtuple->t_data->t_ctid = tuple->t_data->t_ctid;
 		mtuple->t_self = tuple->t_self;
+		HEAPTUPLE_COPY_YBCTID(tuple, mtuple);
 		mtuple->t_tableOid = tuple->t_tableOid;
 	}
 	else
@@ -2474,6 +2478,15 @@ _SPI_execute_plan(SPIPlanPtr plan, const SPIExecuteOptions *options,
 		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc1);
 		List	   *stmt_list;
 		ListCell   *lc2;
+
+		/*
+		 * If the planner found a pg relation in this plan, set the appropriate
+		 * flag for the execution txn.
+		 */
+		if (plansource->usesPostgresRel)
+		{
+			YbSetTxnWithPgOps(YB_TXN_USES_TEMPORARY_RELATIONS);
+		}
 
 		spicallbackarg.query = plansource->query_string;
 

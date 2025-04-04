@@ -45,6 +45,14 @@
 #include "utils/rel.h"
 #include "utils/relmapper.h"
 
+/* YB includes */
+#include "bootstrap/yb_bootstrap.h"
+#include "catalog/pg_database.h"
+#include "commands/yb_cmds.h"
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+#include "storage/pg_shmem.h"
+
 uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 
@@ -355,13 +363,29 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	if (pg_link_canary_is_frontend())
 		elog(ERROR, "backend is incorrectly linked to frontend functions");
 
-	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, false, false, NULL);
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, false, false, NULL, NULL);
 
 	/* Initialize stuff for bootstrap-file processing */
 	for (i = 0; i < MAXATTR; i++)
 	{
 		attrtypes[i] = NULL;
 		Nulls[i] = false;
+	}
+
+
+	/*
+	 * In YugaByte we only need to create the template1 database
+	 * (corresponding to creating the "base/1" subdir as its oid is hardcoded).
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YBCCreateDatabase(Template1DbOid,
+						  "template1",
+						  InvalidOid,
+						  FirstGenbkiObjectId,
+						  false /* colocated */ ,
+						  NULL /* retry_on_oid_collision */ ,
+						  NULL /* yb_clone_info */ );
 	}
 
 	/*
@@ -371,11 +395,15 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	boot_yyparse();
 	CommitTransactionCommand();
 
-	/*
-	 * We should now know about all mapped relations, so it's okay to write
-	 * out the initial relation mapping files.
-	 */
-	RelationMapFinishBootstrap();
+	/* We do not use a relation map file in YugaByte mode yet */
+	if (!IsYugaByteEnabled())
+	{
+		/*
+		 * We should now know about all mapped relations, so it's okay to write
+		 * out the initial relation mapping files.
+		 */
+		RelationMapFinishBootstrap();
+	}
 
 	/* Clean up and exit */
 	cleanup();
@@ -405,6 +433,8 @@ bootstrap_signals(void)
 	pqsignal(SIGINT, SIG_DFL);
 	pqsignal(SIGTERM, SIG_DFL);
 	pqsignal(SIGQUIT, SIG_DFL);
+	if (YBIsEnabledInPostgresEnvVar() || YBIsLocalInitdbEnvVar())
+		pqsignal(SIGABRT, YbRemoveSharedMemory);
 }
 
 /* ----------------------------------------------------------------
@@ -620,9 +650,20 @@ InsertOneTuple(void)
 
 	tupDesc = CreateTupleDesc(numattr, attrtypes);
 	tuple = heap_form_tuple(tupDesc, values, Nulls);
+	if (IsYugaByteEnabled())
+	{
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(tupDesc,
+														&TTSOpsHeapTuple);
+
+		ExecStoreHeapTuple(tuple, slot, false);
+		YBCExecuteInsert(boot_reldesc, slot, ONCONFLICT_NONE);
+		ExecDropSingleTupleTableSlot(slot);
+	}
+	else
+		simple_heap_insert(boot_reldesc, tuple);
+
 	pfree(tupDesc);				/* just free's tupDesc, not the attrtypes */
 
-	simple_heap_insert(boot_reldesc, tuple);
 	heap_freetuple(tuple);
 	elog(DEBUG4, "row inserted");
 

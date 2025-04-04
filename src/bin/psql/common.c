@@ -227,9 +227,11 @@ void
 NoticeProcessor(void *arg, const char *message)
 {
 	(void) arg;					/* not used */
+
+	yb_set_should_log_filename(!GetVariable(pset.vars, "YB_DISABLE_ERROR_PREFIX"));
+
 	pg_log_info("%s", message);
 }
-
 
 
 /*
@@ -728,8 +730,14 @@ StoreQueryTuple(const PGresult *result)
 
 			if (VariableHasHook(pset.vars, varname))
 			{
-				pg_log_warning("attempt to \\gset into specially treated variable \"%s\" ignored",
-							   varname);
+				/*
+				 * YB: the following code is commented out since we don't have
+				 * pg_log_warning macro. Porting over pg_log_warning would
+				 * require other commits which can be done later.
+				 *
+				 *	pg_log_warning("attempt to \\gset into specially treated variable \"%s\" ignored",
+				 *				   varname);
+				 */
 				continue;
 			}
 

@@ -66,6 +66,10 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_ash.h"
+
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
 
 /* Our shared memory area */
@@ -265,7 +269,7 @@ typedef enum KAXCompressReason
 	KAX_PRUNE,					/* we just pruned old entries */
 	KAX_TRANSACTION_END,		/* we just committed/removed some XIDs */
 	KAX_STARTUP_PROCESS_IDLE	/* startup process is about to sleep */
-} KAXCompressReason;
+}			KAXCompressReason;
 
 
 static ProcArrayStruct *procArray;
@@ -583,29 +587,45 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 	myoff = proc->pgxactoff;
 
 	Assert(myoff >= 0 && myoff < arrayP->numProcs);
+
+	int			foundoff = ProcGlobal->allProcs[arrayP->pgprocnos[myoff]].pgxactoff;
+
+	if (unlikely(foundoff != myoff))
+		ereport(WARNING, (errcode(ERRCODE_INTERNAL_ERROR),
+						  errmsg("inconsistent state due to pgxactoff mismatch "
+								 "for process with pid %d", proc->pid),
+						  errdetail("Provided proc's pgxactoff is %d, whereas "
+									"found proc's pgxactoff is %d.",
+									myoff, foundoff)));
 	Assert(ProcGlobal->allProcs[arrayP->pgprocnos[myoff]].pgxactoff == myoff);
 
-	if (TransactionIdIsValid(latestXid))
+	/*
+	 * Postgres transaction related code-paths are disabled for YB.
+	 */
+	if (!IsYugaByteEnabled())
 	{
-		Assert(TransactionIdIsValid(ProcGlobal->xids[myoff]));
+		if (TransactionIdIsValid(latestXid))
+		{
+			Assert(TransactionIdIsValid(ProcGlobal->xids[myoff]));
 
-		/* Advance global latestCompletedXid while holding the lock */
-		MaintainLatestCompletedXid(latestXid);
+			/* Advance global latestCompletedXid while holding the lock */
+			MaintainLatestCompletedXid(latestXid);
 
-		/* Same with xactCompletionCount  */
-		ShmemVariableCache->xactCompletionCount++;
+			/* Same with xactCompletionCount  */
+			ShmemVariableCache->xactCompletionCount++;
 
-		ProcGlobal->xids[myoff] = InvalidTransactionId;
-		ProcGlobal->subxidStates[myoff].overflowed = false;
-		ProcGlobal->subxidStates[myoff].count = 0;
-	}
-	else
-	{
-		/* Shouldn't be trying to remove a live transaction here */
+			ProcGlobal->xids[myoff] = InvalidTransactionId;
+			ProcGlobal->subxidStates[myoff].overflowed = false;
+			ProcGlobal->subxidStates[myoff].count = 0;
+		}
+		else
+		{
+			/* Shouldn't be trying to remove a live transaction here */
+			Assert(!TransactionIdIsValid(ProcGlobal->xids[myoff]));
+		}
 		Assert(!TransactionIdIsValid(ProcGlobal->xids[myoff]));
 	}
 
-	Assert(!TransactionIdIsValid(ProcGlobal->xids[myoff]));
 	Assert(ProcGlobal->subxidStates[myoff].count == 0);
 	Assert(ProcGlobal->subxidStates[myoff].overflowed == false);
 
@@ -651,7 +671,6 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 	LWLockRelease(ProcArrayLock);
 }
 
-
 /*
  * ProcArrayEndTransaction -- mark a transaction as no longer running
  *
@@ -678,6 +697,8 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		 */
 		Assert(TransactionIdIsValid(proc->xid));
 
+		if (!YbGetPgOpsInCurrentTxn())
+			return;
 		/*
 		 * If we can immediately acquire ProcArrayLock, we clear our own XID
 		 * and release the lock.  If not, use group XID clearing to improve
@@ -909,6 +930,11 @@ ProcArrayClearTransaction(PGPROC *proc)
 {
 	int			pgxactoff;
 
+	if (IsYugaByteEnabled())
+	{
+		return;
+	}
+
 	/*
 	 * Currently we need to lock ProcArrayLock exclusively here, as we
 	 * increment xactCompletionCount below. We also need it at least in shared
@@ -1026,6 +1052,11 @@ ProcArrayInitRecovery(TransactionId initializedUptoXID)
 	Assert(standbyState == STANDBY_INITIALIZED);
 	Assert(TransactionIdIsNormal(initializedUptoXID));
 
+	if (IsYugaByteEnabled())
+	{
+		return;
+	}
+
 	/*
 	 * we set latestObservedXid to the xid SUBTRANS has been initialized up
 	 * to, so we can extend it from that point onwards in
@@ -1057,6 +1088,11 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	TransactionId *xids;
 	int			nxids;
 	int			i;
+
+	if (IsYugaByteEnabled())
+	{
+		return;
+	}
 
 	Assert(standbyState >= STANDBY_INITIALIZED);
 	Assert(TransactionIdIsValid(running->nextXid));
@@ -1304,6 +1340,11 @@ ProcArrayApplyXidAssignment(TransactionId topxid,
 	TransactionId max_xid;
 	int			i;
 
+	if (IsYugaByteEnabled())
+	{
+		return;
+	}
+
 	Assert(standbyState >= STANDBY_INITIALIZED);
 
 	max_xid = TransactionIdLatest(topxid, nsubxids, subxids);
@@ -1394,6 +1435,11 @@ TransactionIdIsInProgress(TransactionId xid)
 	int			mypgxactoff;
 	int			numProcs;
 	int			j;
+
+	if (IsYugaByteEnabled())
+	{
+		return false;
+	}
 
 	/*
 	 * Don't bother checking a transaction older than RecentXmin; it could not
@@ -1626,6 +1672,11 @@ TransactionIdIsActive(TransactionId xid)
 	TransactionId *other_xids = ProcGlobal->xids;
 	int			i;
 
+	if (IsYugaByteEnabled())
+	{
+		return false;
+	}
+
 	/*
 	 * Don't bother checking a transaction older than RecentXmin; it could not
 	 * possibly still be running.
@@ -1729,6 +1780,11 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 	TransactionId kaxmin;
 	bool		in_recovery = RecoveryInProgress();
 	TransactionId *other_xids = ProcGlobal->xids;
+
+	if (IsYugaByteEnabled())
+	{
+		return;
+	}
 
 	/* inferred after ProcArrayLock is released */
 	h->catalog_oldest_nonremovable = InvalidTransactionId;
@@ -2178,6 +2234,9 @@ GetSnapshotDataReuse(Snapshot snapshot)
 
 	GetSnapshotDataInitOldSnapshot(snapshot);
 
+	snapshot->yb_read_time_point_handle = YbBuildCurrentReadTimePointHandle();
+	snapshot->yb_cdc_snapshot_read_time.has_value = false;
+	snapshot->yb_cdc_snapshot_read_time.value = 0;
 	return true;
 }
 
@@ -2564,6 +2623,9 @@ GetSnapshotData(Snapshot snapshot)
 
 	GetSnapshotDataInitOldSnapshot(snapshot);
 
+	snapshot->yb_read_time_point_handle = YbBuildCurrentReadTimePointHandle();
+	snapshot->yb_cdc_snapshot_read_time.has_value = false;
+	snapshot->yb_cdc_snapshot_read_time.value = 0;
 	return snapshot;
 }
 
@@ -5245,4 +5307,33 @@ KnownAssignedXidsReset(void)
 	pArray->headKnownAssignedXids = 0;
 
 	LWLockRelease(ProcArrayLock);
+}
+
+void
+YbStorePgAshSamples(TimestampTz sample_time)
+{
+	int			i;
+	int			samples_considered = 0;
+
+	ProcArrayStruct *arrayP = procArray;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (i = 0; i < arrayP->numProcs; ++i)
+	{
+		int			pgprocno = arrayP->pgprocnos[i];
+		PGPROC	   *proc = &allProcs[pgprocno];
+
+		/* Don't sample if ASH metadata is not set */
+		if (!proc->yb_is_ash_metadata_set ||
+			YbIsIdleWaitEvent(proc->wait_event_info))
+			continue;
+
+		YbAshMaybeIncludeSample(proc, arrayP->numProcs, sample_time,
+								&samples_considered);
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	YbAshFillSampleWeight(samples_considered);
 }

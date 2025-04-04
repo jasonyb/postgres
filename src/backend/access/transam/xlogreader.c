@@ -41,6 +41,11 @@
 #include "common/logging.h"
 #endif
 
+/* YB includes */
+#ifndef FRONTEND
+#include "pg_yb_utils.h"
+#endif
+
 static void report_invalid_record(XLogReaderState *state, const char *fmt,...)
 			pg_attribute_printf(2, 3);
 static bool allocate_recordbuf(XLogReaderState *state, uint32 reclength);
@@ -150,6 +155,11 @@ XLogReaderAllocate(int wal_segment_size, const char *waldir,
 		return NULL;
 	}
 	state->errormsg_buf[0] = '\0';
+
+#ifndef FRONTEND
+	if (IsYugaByteEnabled())
+		state->yb_virtual_wal_record = NULL;
+#endif
 
 	/*
 	 * Allocate an initial readRecordBuf of minimal size, which can later be
@@ -282,7 +292,7 @@ XLogRecPtr
 XLogReleasePreviousRecord(XLogReaderState *state)
 {
 	DecodedXLogRecord *record;
-	XLogRecPtr		next_lsn;
+	XLogRecPtr	next_lsn;
 
 	if (!state->record)
 		return InvalidXLogRecPtr;
@@ -1600,6 +1610,12 @@ ResetDecoder(XLogReaderState *state)
 	/* Clear error state. */
 	state->errormsg_buf[0] = '\0';
 	state->errormsg_deferred = false;
+}
+
+void
+YBResetDecoder(XLogReaderState *state)
+{
+	ResetDecoder(state);
 }
 
 /*

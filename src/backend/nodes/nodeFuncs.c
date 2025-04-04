@@ -24,6 +24,9 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+
 static bool expression_returns_set_walker(Node *node, void *context);
 static int	leftmostLoc(int loc1, int loc2);
 static bool fix_opfuncids_walker(Node *node, void *context);
@@ -64,6 +67,9 @@ exprType(const Node *expr)
 			break;
 		case T_WindowFunc:
 			type = ((const WindowFunc *) expr)->wintype;
+			break;
+		case T_YbBatchedExpr:
+			type = exprType((Node *) ((const YbBatchedExpr *) expr)->orig_expr);
 			break;
 		case T_SubscriptingRef:
 			type = ((const SubscriptingRef *) expr)->refrestype;
@@ -1945,6 +1951,8 @@ expression_tree_walker(Node *node,
 		case T_CTESearchClause:
 			/* primitive node types with no expression subnodes */
 			break;
+		case T_YbBatchedExpr:
+			return walker(((YbBatchedExpr *) node)->orig_expr, context);
 		case T_WithCheckOption:
 			return walker(((WithCheckOption *) node)->qual, context);
 		case T_Aggref:
@@ -2282,6 +2290,14 @@ expression_tree_walker(Node *node,
 			break;
 		case T_PartitionPruneStepCombine:
 			/* no expression subnodes */
+			break;
+		case T_YbPartitionPruneStepFuncOp:
+			{
+				YbPartitionPruneStepFuncOp *fstep = (YbPartitionPruneStepFuncOp *) node;
+
+				if (walker((Node *) fstep->exprs, context))
+					return true;
+			}
 			break;
 		case T_JoinExpr:
 			{
@@ -2694,6 +2710,15 @@ expression_tree_mutator(Node *node,
 		case T_SortGroupClause:
 		case T_CTESearchClause:
 			return (Node *) copyObject(node);
+		case T_YbBatchedExpr:
+			{
+				YbBatchedExpr *bexpr = (YbBatchedExpr *) node;
+				YbBatchedExpr *newnode;
+
+				FLATCOPY(newnode, bexpr, YbBatchedExpr);
+				MUTATE(newnode->orig_expr, bexpr->orig_expr, Expr *);
+				return (Node *) newnode;
+			}
 		case T_WithCheckOption:
 			{
 				WithCheckOption *wco = (WithCheckOption *) node;
@@ -3005,7 +3030,7 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, rcexpr, RowCompareExpr);
 				MUTATE(newnode->largs, rcexpr->largs, List *);
-				MUTATE(newnode->rargs, rcexpr->rargs, List *);
+				MUTATE(newnode->rargs, rcexpr->rargs, Node *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3221,6 +3246,16 @@ expression_tree_mutator(Node *node,
 		case T_PartitionPruneStepCombine:
 			/* no expression sub-nodes */
 			return (Node *) copyObject(node);
+		case T_YbPartitionPruneStepFuncOp:
+			{
+				YbPartitionPruneStepFuncOp *fstep = (YbPartitionPruneStepFuncOp *) node;
+				YbPartitionPruneStepFuncOp *newnode;
+
+				FLATCOPY(newnode, fstep, YbPartitionPruneStepFuncOp);
+				MUTATE(newnode->exprs, fstep->exprs, List *);
+				return (Node *) newnode;
+			}
+			break;
 		case T_JoinExpr:
 			{
 				JoinExpr   *join = (JoinExpr *) node;
@@ -3333,6 +3368,16 @@ expression_tree_mutator(Node *node,
 				MUTATE(newnode->rowexpr, tf->rowexpr, Node *);
 				MUTATE(newnode->colexprs, tf->colexprs, List *);
 				MUTATE(newnode->coldefexprs, tf->coldefexprs, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RestrictInfo:
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) node;
+				RestrictInfo *newnode;
+
+				FLATCOPY(newnode, rinfo, RestrictInfo);
+				MUTATE(newnode->clause, rinfo->clause, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -4200,4 +4245,60 @@ planstate_walk_members(PlanState **planstates, int nplans,
 	}
 
 	return false;
+}
+
+/*
+ * Given PlanState, return pointer to aggrefs field if it exists, NULL
+ * otherwise.
+ */
+List	  **
+YbPlanStateTryGetAggrefs(PlanState *ps)
+{
+	switch (nodeTag(ps))
+	{
+		case T_ForeignScanState:
+			return &castNode(ForeignScanState, ps)->yb_fdw_aggrefs;
+		case T_IndexOnlyScanState:
+			return &castNode(IndexOnlyScanState, ps)->yb_ioss_aggrefs;
+		case T_IndexScanState:
+			return &castNode(IndexScanState, ps)->yb_iss_aggrefs;
+		case T_YbSeqScanState:
+			return &castNode(YbSeqScanState, ps)->aggrefs;
+		case T_YbBitmapTableScanState:
+			return &castNode(YbBitmapTableScanState, ps)->aggrefs;
+		default:
+			return NULL;
+	}
+}
+
+bool
+YbGetBitmapScanRecheckRequired(PlanState *ps)
+{
+	switch (nodeTag(ps))
+	{
+		case T_BitmapOrState:
+			{
+				BitmapOrState *bos = castNode(BitmapOrState, ps);
+
+				for (int i = 0; i < bos->nplans; i++)
+					if (YbGetBitmapScanRecheckRequired(bos->bitmapplans[i]))
+						return true;
+				return false;
+			}
+		case T_BitmapAndState:
+			{
+				BitmapAndState *bas = castNode(BitmapAndState, ps);
+
+				for (int i = 0; i < bas->nplans; i++)
+					if (YbGetBitmapScanRecheckRequired(bas->bitmapplans[i]))
+						return true;
+				return false;
+			}
+		case T_YbBitmapIndexScanState:
+			return castNode(YbBitmapIndexScanState, ps)->biss_requires_recheck;
+		default:
+			elog(ERROR, "unrecognized node type: %d",
+				 (int) nodeTag(ps));
+			break;
+	}
 }

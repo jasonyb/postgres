@@ -26,6 +26,11 @@
 #include "optimizer/planmain.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "optimizer/planner.h"
+#include "optimizer/restrictinfo.h"
+#include "pg_yb_utils.h"
+
 /* Hook for plugins to get control in add_paths_to_joinrel() */
 set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
 
@@ -95,6 +100,9 @@ static void generate_mergejoin_paths(PlannerInfo *root,
 									 List *merge_pathkeys,
 									 bool is_partial);
 
+static bool yb_has_non_evaluable_bnl_clauses(Path *outer_path,
+											 Path *inner_path,
+											 List *rinfos);
 
 /*
  * add_paths_to_joinrel
@@ -132,6 +140,18 @@ add_paths_to_joinrel(PlannerInfo *root,
 	bool		mergejoin_allowed = true;
 	ListCell   *lc;
 	Relids		joinrelids;
+
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		char ybMsgBuf[30];
+		sprintf(ybMsgBuf, "(UID %u) ", ybGetNextUid(root->glob));
+		ereport(DEBUG1,
+				(errmsg("\n%s BEGIN add_paths_to_joinrel Level %d\n", ybMsgBuf,
+						bms_num_members(joinrel->relids))));
+		ybTraceRelOptInfo(root, joinrel, "join rel");
+		ybTraceRelOptInfo(root, outerrel, "outer rel");
+		ybTraceRelOptInfo(root, innerrel, "inner rel");
+	}
 
 	/*
 	 * PlannerInfo doesn't contain the SpecialJoinInfos created for joins
@@ -198,6 +218,20 @@ add_paths_to_joinrel(PlannerInfo *root,
 													restrictlist,
 													false);
 			break;
+	}
+
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		char ybMsgBuf[30];
+		sprintf(ybMsgBuf, "(UID %u) ", ybGetNextUid(root->glob));
+		StringInfoData buf;
+		initStringInfo(&buf);
+		ybBuildRelidsString(root, innerrel->relids, &buf);
+		ereport(DEBUG1,
+				(errmsg("\n%s inner rel %s is unique ? %s\n",
+						ybMsgBuf, buf.data,
+						extra.inner_unique ? "true" : "false")));
+		pfree(buf.data);
 	}
 
 	/*
@@ -335,6 +369,14 @@ add_paths_to_joinrel(PlannerInfo *root,
 	if (set_join_pathlist_hook)
 		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
 							   jointype, &extra);
+
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		char ybMsgBuf[30];
+		sprintf(ybMsgBuf, "(UID %u) ", ybGetNextUid(root->glob));
+		ereport(DEBUG1,
+				(errmsg("\n%s END add_paths_to_joinrel\n", ybMsgBuf)));
+	}
 }
 
 /*
@@ -717,6 +759,47 @@ try_nestloop_path(PlannerInfo *root,
 			if (!inner_path)
 			{
 				bms_free(required_outer);
+				return;
+			}
+		}
+
+		if (IsYugaByteEnabled() && YB_PATH_NEEDS_BATCHED_RELS(inner_path))
+		{
+			/*
+			 * YB: Check to make sure this is a valid BNL.
+			 */
+			if (yb_has_non_evaluable_bnl_clauses(outer_path,
+												 inner_path,
+												 extra->restrictlist) ||
+				(yb_has_non_evaluable_bnl_clauses(outer_path,
+												  inner_path,
+												  inner_path->param_info
+												  ->ppi_clauses)))
+			{
+				bms_free(required_outer);
+				return;
+			}
+		}
+
+		if (IsYugaByteEnabled())
+		{
+			/*
+			 * YB: Check to see if there are any conflicting unbatched and batched
+			 * requirements.
+			 */
+			Relids		unbatched = bms_union(YB_PATH_REQ_OUTER_UNBATCHED(inner_path),
+											  YB_PATH_REQ_OUTER_UNBATCHED(outer_path));
+			Relids		batched = bms_union(YB_PATH_REQ_OUTER_BATCHED(outer_path),
+											YB_PATH_REQ_OUTER_BATCHED(inner_path));
+			bool		yb_is_nl_batched = bms_overlap(YB_PATH_REQ_OUTER_BATCHED(inner_path),
+													   outerrelids);
+
+			if (bms_overlap(unbatched, batched) ||
+				(yb_is_nl_batched && bms_overlap(unbatched, outerrelids)))
+			{
+				bms_free(required_outer);
+				bms_free(unbatched);
+				bms_free(batched);
 				return;
 			}
 		}
@@ -1578,6 +1661,52 @@ generate_mergejoin_paths(PlannerInfo *root,
 	}
 }
 
+Relids
+yb_get_batched_relids(NestPath *nest)
+{
+	Relids		outer_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(nest->jpath.outerjoinpath);
+	Relids		inner_batched = YB_PATH_REQ_OUTER_BATCHED(nest->jpath.innerjoinpath);
+
+	Assert(!bms_overlap(inner_batched, outer_unbatched));
+	(void) outer_unbatched;
+
+	Relids		outerrels = nest->jpath.outerjoinpath->parent->relids;
+
+	return bms_intersect(inner_batched, outerrels);
+}
+
+Relids
+yb_get_unbatched_relids(NestPath *nest)
+{
+	Relids		outer_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(nest->jpath.outerjoinpath);
+	Relids		inner_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(nest->jpath.innerjoinpath);
+
+	/* Rels not in this join that can't be batched. */
+	Relids		param_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(&nest->jpath.path);
+
+	return bms_union(outer_unbatched,
+					 bms_union(inner_unbatched, param_unbatched));
+}
+
+bool
+yb_is_outer_inner_batched(Path *outer, Path *inner)
+{
+	Relids		outer_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(outer);
+	Relids		inner_batched = YB_PATH_REQ_OUTER_BATCHED(inner);
+
+	return bms_overlap(outer->parent->relids,
+					   bms_difference(inner_batched, outer_unbatched));
+}
+
+bool
+yb_is_nestloop_batched(NestPath *nest)
+{
+	Relids		batched_relids = yb_get_batched_relids(nest);
+
+	return bms_overlap(nest->jpath.outerjoinpath->parent->relids,
+					   batched_relids);
+}
+
 /*
  * match_unsorted_outer
  *	  Creates possible join paths for processing a single join relation
@@ -1683,6 +1812,11 @@ match_unsorted_outer(PlannerInfo *root,
 			!ExecMaterializesOutput(inner_cheapest_total->pathtype))
 			matpath = (Path *)
 				create_material_path(innerrel, inner_cheapest_total);
+
+		if (IsYugaByteEnabled() && matpath != NULL)
+		{
+			yb_assign_unique_path_node_id(root, matpath);
+		}
 	}
 
 	foreach(lc1, outerrel->pathlist)
@@ -1741,8 +1875,9 @@ match_unsorted_outer(PlannerInfo *root,
 			 * inner relation, including the unparameterized case.
 			 */
 			ListCell   *lc2;
+			List	   *param_paths = innerrel->cheapest_parameterized_paths;
 
-			foreach(lc2, innerrel->cheapest_parameterized_paths)
+			foreach(lc2, param_paths)
 			{
 				Path	   *innerpath = (Path *) lfirst(lc2);
 				Path	   *mpath;
@@ -2328,4 +2463,48 @@ select_mergejoin_clauses(PlannerInfo *root,
 	}
 
 	return result_list;
+}
+
+/*
+ * A batched clause can be non_evaluable if it requires input relations
+ * A and B on its outer side but And B are not joined together in the context
+ * of this clause.
+ * Therefore the clause does not directly receive all elements of A x B.
+ * We can detect these bad cases with the following logic. If a certain inner
+ * path, I, satisfies a certain batched restriction clause that needs an
+ * input outer relation set of S. We need to be sure to never join I to outer
+ * path O if O only partially fulfills S. For example, if O has relations {1,2}
+ * and S = {1,3} then we cannot join O to I as I will not receieve a cross
+ * product of relations 1 and 3. On the other hand, if O had relations {1,3,4},
+ * the join would be acceptable.
+ */
+static bool
+yb_has_non_evaluable_bnl_clauses(Path *outer_path, Path *inner_path,
+								 List *rinfos)
+{
+	ListCell   *lc;
+	Relids		req_batched_rels = YB_PATH_REQ_OUTER_BATCHED(inner_path);
+	Relids		outer_relids = outer_path->parent->relids;
+	Relids		inner_relids = inner_path->parent->relids;
+
+	foreach(lc, rinfos)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		RestrictInfo *batched_rinfo = yb_get_batched_restrictinfo(rinfo,
+																  outer_relids,
+																  inner_relids);
+
+		if (!batched_rinfo)
+			continue;
+
+		Relids		right_relids = batched_rinfo->right_relids;
+
+		right_relids = bms_intersect(right_relids, req_batched_rels);
+		if (bms_overlap(right_relids, outer_relids) &&
+			!bms_is_subset(right_relids, outer_relids))
+		{
+			return true;
+		}
+	}
+	return false;
 }

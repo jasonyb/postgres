@@ -53,6 +53,9 @@
 #include "pg_config_paths.h"
 #include "port/pg_bswap.h"
 
+/* YB includes */
+#include <stdatomic.h>
+
 static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
 static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
@@ -1239,7 +1242,7 @@ libpq_binddomain(void)
 	 * complete, so don't set the flag till that's done.  Use "volatile" just
 	 * to be sure the compiler doesn't try to get cute.
 	 */
-	static volatile bool already_bound = false;
+	static atomic_bool already_bound = false;
 
 	if (!already_bound)
 	{

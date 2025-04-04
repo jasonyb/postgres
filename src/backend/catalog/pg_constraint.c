@@ -35,6 +35,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/catcache.h"
+
 
 /*
  * CreateConstraintEntry
@@ -646,7 +650,7 @@ RemoveConstraintById(Oid conId)
 		elog(ERROR, "constraint %u is not of a known type", conId);
 
 	/* Fry the constraint itself */
-	CatalogTupleDelete(conDesc, &tup->t_self);
+	CatalogTupleDelete(conDesc, tup);
 
 	/* Clean up */
 	ReleaseSysCache(tup);
@@ -911,7 +915,7 @@ get_relation_constraint_oid(Oid relid, const char *conname, bool missing_ok)
  * failure.
  */
 Bitmapset *
-get_relation_constraint_attnos(Oid relid, const char *conname,
+get_relation_constraint_attnos(Relation rel, const char *conname,
 							   bool missing_ok, Oid *constraintOid)
 {
 	Bitmapset  *conattnos = NULL;
@@ -919,6 +923,7 @@ get_relation_constraint_attnos(Oid relid, const char *conname,
 	HeapTuple	tuple;
 	SysScanDesc scan;
 	ScanKeyData skey[3];
+	Oid			relid = RelationGetRelid(rel);
 
 	/* Set *constraintOid, to avoid complaints about uninitialized vars */
 	*constraintOid = InvalidOid;
@@ -972,7 +977,7 @@ get_relation_constraint_attnos(Oid relid, const char *conname,
 			for (i = 0; i < numcols; i++)
 			{
 				conattnos = bms_add_member(conattnos,
-										   attnums[i] - FirstLowInvalidHeapAttributeNumber);
+										   attnums[i] - YBGetFirstLowInvalidAttributeNumber(rel));
 			}
 		}
 	}
@@ -1113,22 +1118,35 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 	HeapTuple	tuple;
 	SysScanDesc scan;
 	ScanKeyData skey[1];
+	YbCatCListIterator iterator;
 
 	/* Set *constraintOid, to avoid complaints about uninitialized vars */
 	*constraintOid = InvalidOid;
 
-	/* Scan pg_constraint for constraints of the target rel */
-	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	/*
+	 * YB change: Search the catcache here to avoid having to go to master.
+	 * This will trigger a master RPC if this is the first time we're looking
+	 * up the primary key for this relation.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		iterator = YbCatCListIteratorBegin(SearchSysCacheList1(YBCONSTRAINTRELIDTYPIDNAME, relid));
+	}
+	else
+	{
+		/* Scan pg_constraint for constraints of the target rel */
+		pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
 
-	ScanKeyInit(&skey[0],
-				Anum_pg_constraint_conrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relid));
+		ScanKeyInit(&skey[0],
+					Anum_pg_constraint_conrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
 
-	scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId, true,
-							  NULL, 1, skey);
+		scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId, true,
+								  NULL, 1, skey);
+	}
 
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	while (HeapTupleIsValid(tuple = IsYugaByteEnabled() ? YbCatCListIteratorGetNext(&iterator) : systable_getnext(scan)))
 	{
 		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
 		Datum		adatum;
@@ -1151,8 +1169,9 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 			break;
 
 		/* Extract the conkey array, ie, attnums of PK's columns */
-		adatum = heap_getattr(tuple, Anum_pg_constraint_conkey,
-							  RelationGetDescr(pg_constraint), &isNull);
+		adatum = IsYugaByteEnabled()
+			? SysCacheGetAttr(CONSTROID, tuple, Anum_pg_constraint_conkey, &isNull)
+			: heap_getattr(tuple, Anum_pg_constraint_conkey, RelationGetDescr(pg_constraint), &isNull);
 		if (isNull)
 			elog(ERROR, "null conkey for constraint %u",
 				 ((Form_pg_constraint) GETSTRUCT(tuple))->oid);
@@ -1177,9 +1196,14 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 		break;
 	}
 
-	systable_endscan(scan);
+	if (IsYugaByteEnabled())
+		YbCatCListIteratorFree(&iterator);
+	else
+	{
+		systable_endscan(scan);
 
-	table_close(pg_constraint, AccessShareLock);
+		table_close(pg_constraint, AccessShareLock);
+	}
 
 	return pkattnos;
 }

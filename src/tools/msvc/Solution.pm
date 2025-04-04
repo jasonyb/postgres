@@ -247,7 +247,6 @@ sub GenerateFiles
 		HAVE_DECL_RTLD_GLOBAL                       => 0,
 		HAVE_DECL_RTLD_NOW                          => 0,
 		HAVE_DECL_SIGWAIT                           => 0,
-		HAVE_DECL_STRCHRNUL                         => 0,
 		HAVE_DECL_STRLCAT                           => 0,
 		HAVE_DECL_STRLCPY                           => 0,
 		HAVE_DECL_STRNLEN                           => 1,
@@ -368,6 +367,7 @@ sub GenerateFiles
 		HAVE_STDBOOL_H                           => 1,
 		HAVE_STDINT_H                            => 1,
 		HAVE_STDLIB_H                            => 1,
+		HAVE_STRCHRNUL                           => undef,
 		HAVE_STRERROR_R                          => undef,
 		HAVE_STRINGS_H                           => undef,
 		HAVE_STRING_H                            => 1,
@@ -645,8 +645,6 @@ sub GenerateFiles
 		system(
 			'perl src/backend/utils/Gen_dummy_probes.pl src/backend/utils/probes.d > src/include/utils/probes.h'
 		);
-	}
-
 	if ($self->{options}->{python}
 		&& IsNewer(
 			'src/pl/plpython/spiexceptions.h',

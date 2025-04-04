@@ -28,6 +28,9 @@
 #include "storage/sinvaladt.h"
 #include "utils/inval.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * Per-backend counter for generating speculative insertion tokens.
@@ -330,6 +333,15 @@ UnlockRelation(Relation relation, LOCKMODE lockmode)
 bool
 CheckRelationLockedByMe(Relation relation, LOCKMODE lockmode, bool orstronger)
 {
+	/*
+	 * In LockAcquireExtended, YB reports LOCKACQUIRE_OK if we attempt to
+	 * acquire a lock on any relation, because locking is handled separately.
+	 * We always return true here because we assume that the caller has already
+	 * tried to acquire the lock.
+	 */
+	if (!YBIsPgLockingEnabled())
+		return true;
+
 	LOCKTAG		tag;
 
 	SET_LOCKTAG_RELATION(tag,
@@ -607,6 +619,12 @@ UnlockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_TUPLE(tag,
 					  relation->rd_lockInfo.lockRelId.dbId,
 					  relation->rd_lockInfo.lockRelId.relId,
@@ -628,6 +646,12 @@ XactLockTableInsert(TransactionId xid)
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_TRANSACTION(tag, xid);
 
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
@@ -644,6 +668,12 @@ void
 XactLockTableDelete(TransactionId xid)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_TRANSACTION(tag, xid);
 
@@ -672,6 +702,12 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	XactLockTableWaitInfo info;
 	ErrorContextCallback callback;
 	bool		first = true;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	/*
 	 * If an operation is specified, set up our verbose error context
@@ -743,6 +779,13 @@ ConditionalXactLockTableWait(TransactionId xid)
 	LOCKTAG		tag;
 	bool		first = true;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		/* Pretend the lock has been acquired. */
+		return true;
+	}
+
 	for (;;)
 	{
 		Assert(TransactionIdIsValid(xid));
@@ -810,6 +853,12 @@ SpeculativeInsertionLockRelease(TransactionId xid)
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_SPECULATIVE_INSERTION(tag, xid, speculativeInsertionToken);
 
 	LockRelease(&tag, ExclusiveLock, false);
@@ -825,6 +874,11 @@ void
 SpeculativeInsertionWait(TransactionId xid, uint32 token)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		return;
+	}
 
 	SET_LOCKTAG_SPECULATIVE_INSERTION(tag, xid, token);
 
@@ -912,6 +966,12 @@ WaitForLockersMultiple(List *locktags, LOCKMODE lockmode, bool progress)
 	int			total = 0;
 	int			done = 0;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	/* Done if no locks to wait for */
 	if (list_length(locktags) == 0)
 		return;
@@ -987,6 +1047,12 @@ WaitForLockers(LOCKTAG heaplocktag, LOCKMODE lockmode, bool progress)
 {
 	List	   *l;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	l = list_make1(&heaplocktag);
 	WaitForLockersMultiple(l, lockmode, progress);
 	list_free(l);
@@ -1006,6 +1072,12 @@ LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 				   LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   MyDatabaseId,
@@ -1028,6 +1100,12 @@ UnlockDatabaseObject(Oid classid, Oid objid, uint16 objsubid,
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_OBJECT(tag,
 					   MyDatabaseId,
 					   classid,
@@ -1047,6 +1125,12 @@ LockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 				 LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
@@ -1069,6 +1153,12 @@ UnlockSharedObject(Oid classid, Oid objid, uint16 objsubid,
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
 					   classid,
@@ -1090,6 +1180,12 @@ LockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 {
 	LOCKTAG		tag;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
+
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,
 					   classid,
@@ -1107,6 +1203,12 @@ UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid,
 							 LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/* Locking is handled separately by YugaByte. */
+		return;
+	}
 
 	SET_LOCKTAG_OBJECT(tag,
 					   InvalidOid,

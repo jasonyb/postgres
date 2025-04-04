@@ -52,6 +52,10 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+
 /*
  * All plpgsql function executions within a single transaction share the same
  * executor EState for evaluating "simple" expressions.  Each function call
@@ -1991,6 +1995,25 @@ exec_stmts(PLpgSQL_execstate *estate, List *stmts)
 		PLpgSQL_stmt *stmt = (PLpgSQL_stmt *) lfirst(s);
 		int			rc;
 
+		/*
+		 * Flush buffered operations before executing a new statement since it might
+		 * have non-transactional side-effects that won't be reverted in case the
+		 * buffered operations (i.e., from previous statements) lead to an
+		 * exception.
+		 */
+		if (stmt->cmd_type != PLPGSQL_STMT_EXECSQL)
+		{
+			/*
+			 * PLPGSQL_STMT_EXECSQL commands require flushing for everything except
+			 * UPDATE, INSERT and DELETE. So the handling for that is present in
+			 * exec_stmt_execsql().
+			 *
+			 * The reason for not flushing in case of UPDATE, INSERT and DELETE is
+			 * mentioned in exec_stmt_execsql() which handles PLPGSQL_STMT_EXECSQL.
+			 */
+			YBFlushBufferedOperations();
+		}
+
 		estate->err_stmt = stmt;
 
 		/* Let the plugin know that we are about to execute this statement */
@@ -2279,6 +2302,12 @@ make_callstmt_target(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 	int			nfields;
 	int			i;
 
+	/*
+	 * YB_TODO(zihong@yugabyte)
+	 * - Need to verify if this needs to be changed as in Pg11.
+	 * - Unlike Pg11, Pg13 doesn't call get_stmt_mcontext() on this call which
+	 *   was backported.
+	 */
 	/* Use eval_mcontext for any cruft accumulated here */
 	oldcontext = MemoryContextSwitchTo(get_eval_mcontext(estate));
 
@@ -2819,7 +2848,8 @@ exec_stmt_fors(PLpgSQL_execstate *estate, PLpgSQL_stmt_fors *stmt)
 	/*
 	 * Execute the loop
 	 */
-	rc = exec_for_query(estate, (PLpgSQL_stmt_forq *) stmt, portal, true);
+	rc = exec_for_query(estate, (PLpgSQL_stmt_forq *) stmt, portal,
+						!yb_plpgsql_disable_prefetch_in_for_query);
 
 	/*
 	 * Close the implicit cursor
@@ -3201,7 +3231,7 @@ exec_stmt_return(PLpgSQL_execstate *estate, PLpgSQL_stmt_return *stmt)
 				/* fulfill promise if needed, then handle like regular var */
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
-				/* FALL THRU */
+				switch_fallthrough();
 
 			case PLPGSQL_DTYPE_VAR:
 				{
@@ -3347,7 +3377,7 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 				/* fulfill promise if needed, then handle like regular var */
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
-				/* FALL THRU */
+				switch_fallthrough();
 
 			case PLPGSQL_DTYPE_VAR:
 				{
@@ -4237,6 +4267,20 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 		}
 		stmt->mod_stmt_set = true;
 	}
+
+	/*
+	 * Flush buffered operations before executing a new statement since it might
+	 * have non-transactional side-effects that won't be reverted in case the
+	 * buffered operations (i.e., from previous statements) lead to an exception.
+	 *
+	 * If we know that the new statement is an INSERT, UPDATE or DELETE, we
+	 * can skip flushing since these statements have only transactional
+	 * effects. And an exception that occurs later due to previously buffered
+	 * operations (i.e., from previous statements) will lead to reverting
+	 * of the transactional effects of the new statement too.
+	 */
+	if (!stmt->mod_stmt)
+		YBFlushBufferedOperations();
 
 	/*
 	 * Set up ParamListInfo to pass to executor
@@ -5296,7 +5340,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 			/* fulfill promise if needed, then handle like regular var */
 			plpgsql_fulfill_promise(estate, (PLpgSQL_var *) datum);
 
-			/* FALL THRU */
+			switch_fallthrough();
 
 		case PLPGSQL_DTYPE_VAR:
 			{
@@ -7376,6 +7420,7 @@ deconstruct_composite_datum(Datum value, HeapTupleData *tmptup)
 	tmptup->t_len = HeapTupleHeaderGetDatumLength(td);
 	ItemPointerSetInvalid(&(tmptup->t_self));
 	tmptup->t_tableOid = InvalidOid;
+	HEAPTUPLE_YBCTID(tmptup) = (Datum) 0;
 	tmptup->t_data = td;
 
 	/* Extract rowtype info and find a tupdesc */
@@ -7550,6 +7595,7 @@ exec_move_row_from_datum(PLpgSQL_execstate *estate,
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 		ItemPointerSetInvalid(&(tmptup.t_self));
 		tmptup.t_tableOid = InvalidOid;
+		HEAPTUPLE_YBCTID(&tmptup) = (Datum) 0;
 		tmptup.t_data = td;
 
 		/* Extract rowtype info */

@@ -59,6 +59,9 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "pg_yb_utils.h"
 
 /*
  * GUC parameters
@@ -303,6 +306,23 @@ vacuum(List *relations, VacuumParams *params,
 	const char *stmttype;
 	volatile bool in_outer_xact,
 				use_own_xacts;
+
+	/*
+	 * VACUUM currently not supported for Yugabyte.
+	 */
+	if (params->options & VACOPT_VACUUM)
+	{
+		ereport(NOTICE,
+				(errmsg("VACUUM is a no-op statement since YugabyteDB performs garbage collection of dead tuples automatically")));
+		if (params->options & VACOPT_ANALYZE)
+		{
+			params->options &= ~VACOPT_VACUUM;
+		}
+		else
+		{
+			return;
+		}
+	}
 
 	Assert(params != NULL);
 
@@ -1335,8 +1355,31 @@ vac_update_relstats(Relation relation,
 
 	rd = table_open(RelationRelationId, RowExclusiveLock);
 
-	/* Fetch a copy of the tuple to scribble on */
-	ctup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	if (IsYugaByteEnabled() && YBIsInitDbModeEnvVarSet())
+	{
+		/*
+		 * YB: workaround for stale cache issue #13500 during initdb.
+		 * Instead of fetching a tuple from sys cache,
+		 * read the tuple from pg_class directly.
+		 */
+		TableScanDesc pg_class_scan;
+		ScanKeyData key[1];
+
+		ScanKeyInit(&key[0],
+					Anum_pg_class_oid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+
+		pg_class_scan = table_beginscan_catalog(rd, 1, key);
+		ctup = heap_getnext(pg_class_scan, ForwardScanDirection);
+		ctup = heap_copytuple(ctup);
+		heap_endscan(pg_class_scan);
+	}
+	else
+	{
+		/* Fetch a copy of the tuple to scribble on */
+		ctup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	}
 	if (!HeapTupleIsValid(ctup))
 		elog(ERROR, "pg_class entry for relid %u vanished during vacuuming",
 			 relid);
@@ -1444,7 +1487,7 @@ vac_update_relstats(Relation relation,
 
 	/* If anything changed, write out the tuple. */
 	if (dirty)
-		heap_inplace_update(rd, ctup);
+		heap_inplace_update(rd, ctup, false /* yb_shared_update */ );
 
 	table_close(rd, RowExclusiveLock);
 
@@ -1662,7 +1705,7 @@ vac_update_datfrozenxid(void)
 		newMinMulti = dbform->datminmxid;
 
 	if (dirty)
-		heap_inplace_update(relation, tuple);
+		heap_inplace_update(relation, tuple, false /* yb_shared_update */ );
 
 	heap_freetuple(tuple);
 	table_close(relation, RowExclusiveLock);

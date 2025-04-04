@@ -28,6 +28,9 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 static TupleTableSlot *ForeignNext(ForeignScanState *node);
 static bool ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot);
 
@@ -36,6 +39,9 @@ static bool ForeignRecheck(ForeignScanState *node, TupleTableSlot *slot);
  *		ForeignNext
  *
  *		This is a workhorse for ExecForeignScan
+ *
+ * When Yugabyte is acting as foreign DB, its scan will write ybctid to "TupleTableSlot->tts_tid".
+ * Postgres then access the slot data.
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -59,6 +65,10 @@ ForeignNext(ForeignScanState *node)
 		slot = node->fdwroutine->IterateDirectModify(node);
 	}
 	else
+		/*
+		 * YB note: for YB FDW, see comment in ybcIterateForeignScan for why
+		 * YbInstantiatePushdownParams is not called at this level.
+		 */
 		slot = node->fdwroutine->IterateForeignScan(node);
 	MemoryContextSwitchTo(oldcontext);
 
@@ -67,7 +77,9 @@ ForeignNext(ForeignScanState *node)
 	 * column.
 	 */
 	if (plan->fsSystemCol && !TupIsNull(slot))
+	{
 		slot->tts_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
+	}
 
 	return slot;
 }
